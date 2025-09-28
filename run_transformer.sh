@@ -42,14 +42,14 @@ GRAD_CLIP=1.0          # Gradient clipping
 
 # === Distributed Shampoo 하이퍼파라미터 ===
 MAX_PRECONDITIONER_DIM=1024    # Maximum preconditioner dimension
-PRECONDITION_FREQUENCY=25      # Preconditioning frequency
-START_PRECONDITIONING=25        # Step to start preconditioning
+PRECONDITION_FREQUENCY=50      # Preconditioning frequency
+START_PRECONDITIONING=50        # Step to start preconditioning
 
 # === 평가 및 로깅 설정 ===
 SAVE_INTERVAL=1                # 체크포인트 저장 간격
-BLEU_INTERVAL=5                 # BLEU 평가 간격
+BLEU_INTERVAL=3                 # BLEU 평가 간격
 CONDITION_ANALYSIS_INTERVAL=1    # Condition number 분석용 체크포인트 저장 간격
-LOG_CONDITION_INTERVAL=100       # TensorBoard에 condition number 로깅 간격 (배치 단위)
+LOG_CONDITION_INTERVAL=10       # TensorBoard에 condition number 로깅 간격 (배치 단위)
 
 # === 디버깅/개발용 옵션 ===
 MAX_TRAIN_SAMPLES=""   # 빈 값이면 전체 데이터 사용

@@ -27,6 +27,7 @@ except ImportError:
 # Shampoo 옵티마이저 라이브러리 import
 from optimizers.distributed_shampoo.distributed_shampoo import DistributedShampoo
 from optimizers.distributed_shampoo.shampoo_types import (
+    SGDGraftingConfig,
     AdamGraftingConfig,
     DDPShampooConfig,
     CommunicationDType
@@ -363,18 +364,18 @@ def train(args: argparse.Namespace):
         model.parameters(),
         lr=args.base_lr,
         betas=(args.beta1, 0.99),
-        epsilon=1e-8,
+        epsilon=0.05,
         momentum=False,
         weight_decay=args.weight_decay,
         max_preconditioner_dim=1024,
-        precondition_frequency=1,
+        precondition_frequency=100,
         use_normalized_grafting=False,
         inv_root_override=2,
         exponent_multiplier=1,
-        start_preconditioning_step=1,
+        start_preconditioning_step=100,
         use_nadam=False,
         use_decoupled_weight_decay=True,
-        grafting_config=AdamGraftingConfig(beta2=0.999, epsilon=1e-8),
+        grafting_config=AdamGraftingConfig(beta2=0.99, epsilon=1e-6),
         distributed_config=DDPShampooConfig(
             communication_dtype = CommunicationDType.FP32,
             num_trainers_per_group = -1,
@@ -508,7 +509,7 @@ if __name__ == '__main__':
     parser.add_argument('--mixup', type=float, default=0.2, help='Mixup alpha (default: 0.2). Set 0 to disable.')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing (default: 0.1)')
     parser.add_argument('--weight-decay', type=float, default=0.0005, help='Weight decay (default: 0.1)')
-    parser.add_argument('--beta1', type=float, default=0.95, help='Beta1/Momentum (default: 0.9)')
+    parser.add_argument('--beta1', type=float, default=0.9, help='Beta1/Momentum (default: 0.9)')
     parser.add_argument('--save-dir', type=str, default='checkpoints', help='Directory for saving checkpoints')
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
 

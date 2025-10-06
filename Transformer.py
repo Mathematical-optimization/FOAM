@@ -1,4 +1,4 @@
-# Transformer.py (수정된 최종 버전)
+# Transformer.py (최종 개선 버전)
 
 import os
 import math
@@ -7,6 +7,7 @@ import functools
 from typing import Optional, List, Dict, Any
 import time
 import json
+import logging
 
 import torch
 import torch.nn as nn
@@ -34,7 +35,25 @@ import sacrebleu
 from tqdm import tqdm
 
 
-# ============= Transformer 모델 구현 (AlgoPerf 사양) =============
+# ============= Eigh Fallback Counter =============
+
+class EighFallbackCounter(logging.Handler):
+    """'eigh' 연산이 float64로 재시도될 때 발생하는 경고를 카운트합니다."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.count = 0
+        self.setLevel(logging.WARNING)
+
+    def emit(self, record):
+        try:
+            message = record.getMessage()
+            if "Retrying in double precision" in message:
+                self.count += 1
+        except Exception:
+            self.handleError(record)
+
+
+# ============= Transformer 모델 구현 =============
 
 class PositionalEncoding(nn.Module):
     """Positional Encoding with sinusoidal functions"""
@@ -47,7 +66,6 @@ class PositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0).transpose(0, 1)
-        # persistent=False로 설정하여 DDP에서 broadcast되지 않도록 함
         self.register_buffer('pe', pe, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -56,7 +74,7 @@ class PositionalEncoding(nn.Module):
 
 
 class CustomMultiheadAttention(nn.Module):
-    """Multi-Head Attention with separate Q,K,V projections for Shampoo tracking"""
+    """Multi-Head Attention with separate Q,K,V projections"""
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
         assert d_model % n_heads == 0
@@ -243,6 +261,7 @@ def create_data_loaders(args, tokenizer, global_rank, world_size):
 # ============= 학습 함수 =============
 
 def label_smoothed_cross_entropy(logits, targets, epsilon=0.1, ignore_index=-100):
+    """Label smoothing cross entropy loss"""
     vocab_size = logits.size(-1)
     log_probs = F.log_softmax(logits, dim=-1)
     smooth_target = torch.full_like(log_probs, epsilon / (vocab_size - 1))
@@ -252,8 +271,9 @@ def label_smoothed_cross_entropy(logits, targets, epsilon=0.1, ignore_index=-100
     loss = -(smooth_target * log_probs).sum(dim=-1)
     return loss.masked_select(mask).mean()
 
+
 def train_epoch(model, dataloader, optimizer, device, args, global_step, writer, global_rank):
-    """Training epoch with warning fixes"""
+    """Training epoch"""
     model.train()
     total_loss, total_tokens = 0, 0
     progress_bar = tqdm(dataloader, desc=f"Epoch {args.current_epoch+1} Training",
@@ -281,15 +301,14 @@ def train_epoch(model, dataloader, optimizer, device, args, global_step, writer,
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
         optimizer.step()
-
-        # 수정: detach()를 사용하여 gradient 추적 제거
+        
         with torch.no_grad():
             num_tokens = (tgt_output != tokenizer.pad_token_id).sum().item()
-            loss_value = loss.item()  # loss는 이미 backward() 후이므로 detach() 대신 no_grad 사용
+            loss_value = loss.item()
             total_loss += loss_value * num_tokens
             total_tokens += num_tokens
 
-        # 실시간 condition number 로깅
+        # Condition number 로깅
         if global_rank == 0 and batch_idx % args.log_condition_interval == 0:
             log_condition_numbers(optimizer, writer, global_step)
 
@@ -300,10 +319,10 @@ def train_epoch(model, dataloader, optimizer, device, args, global_step, writer,
 
 
 def evaluate(model, dataloader, device, tokenizer):
-    """Evaluation with consistent handling"""
+    """Evaluation"""
     model.eval()
     total_loss, total_tokens = 0, 0
-    with torch.no_grad():  # 이미 no_grad 컨텍스트 안에 있음
+    with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", disable=(dist.get_rank() != 0)):
             src, tgt = batch['src'].to(device), batch['tgt'].to(device)
             tgt_input, tgt_output = tgt[:, :-1], tgt[:, 1:]
@@ -315,13 +334,15 @@ def evaluate(model, dataloader, device, tokenizer):
             )
 
             num_tokens = (tgt_output != tokenizer.pad_token_id).sum().item()
-            loss_value = loss.item()  # no_grad 컨텍스트 내에서는 안전
+            loss_value = loss.item()
             total_loss += loss_value * num_tokens
             total_tokens += num_tokens
 
     return total_loss / total_tokens if total_tokens > 0 else 0
 
+
 def greedy_decode(model, src, max_len, device, tokenizer):
+    """Greedy decoding for translation"""
     model.eval()
     with torch.no_grad():
         src_mask = model.module.create_padding_mask(src)
@@ -342,6 +363,7 @@ def greedy_decode(model, src, max_len, device, tokenizer):
 
 
 def compute_bleu(model, dataloader, device, tokenizer, max_decode_len):
+    """Compute BLEU score"""
     model.eval()
     hypotheses, references = [], []
     with torch.no_grad():
@@ -357,21 +379,21 @@ def compute_bleu(model, dataloader, device, tokenizer, max_decode_len):
 
 
 def get_lr_schedule(step, warmup_steps, d_model):
+    """Transformer learning rate schedule"""
     step = max(1, step)
     return (d_model ** -0.5) * min(step ** -0.5, step * warmup_steps ** -1.5)
 
 
 def log_condition_numbers(optimizer, writer, global_step):
-    """Log condition numbers of Shampoo preconditioners to TensorBoard."""
+    """Log condition numbers of Shampoo preconditioners"""
     try:
         if hasattr(optimizer, '_per_group_state_lists'):
             for group_idx, state_lists in enumerate(optimizer._per_group_state_lists):
                 if 'SHAMPOO_PRECONDITIONER_LIST' in state_lists:
                     preconditioner_list = state_lists['SHAMPOO_PRECONDITIONER_LIST']
 
-                    # 각 Kronecker factor의 condition number 계산
                     for block_idx, kronecker_factors in enumerate(
-                        preconditioner_list._masked_kronecker_factors_list[:10]  # 처음 10개만 로깅
+                        preconditioner_list._masked_kronecker_factors_list[:10]
                     ):
                         for factor_idx, factor_matrix in enumerate(kronecker_factors.factor_matrices):
                             if factor_matrix.shape[0] == factor_matrix.shape[1] and factor_matrix.shape[0] > 1:
@@ -384,65 +406,47 @@ def log_condition_numbers(optimizer, writer, global_step):
                                             global_step
                                         )
                                 except Exception:
-                                    pass  # 계산 실패시 무시
+                                    pass
     except Exception as e:
         print(f"Warning: Failed to log condition numbers: {e}")
 
-# Transformer.py 파일에 있는 기존 함수를 삭제하고 아래 코드로 교체하세요.
 
 def gather_optimizer_state_from_all_ranks(optimizer, model, world_size):
-    """
-    모든 랭크에서 옵티마이저 상태를 수집하고 통합합니다.
-    Distributed Shampoo의 분산된 factor matrices를 올바르게 처리합니다.
-    """
-    # 각 GPU에서 로컬 옵티마이저 상태를 가져옵니다.
+    """모든 랭크에서 옵티마이저 상태를 수집하고 통합"""
     local_state = optimizer.distributed_state_dict(
         key_to_param=model.module.named_parameters()
     )
 
-    # 모든 GPU의 상태를 담을 리스트를 준비합니다.
     all_states = [None] * world_size
-    # `all_gather_object`를 사용해 모든 GPU의 `local_state`를 `all_states` 리스트에 모읍니다.
     dist.all_gather_object(all_states, local_state)
 
-    # rank 0에서만 상태를 병합합니다.
     if dist.get_rank() == 0:
-        # 병합된 상태를 저장할 딕셔너리를 초기화합니다.
         merged_state = {
             'state': {},
-            'param_groups': all_states[0]['param_groups'] # param_groups는 동일하므로 rank 0의 것을 사용
+            'param_groups': all_states[0]['param_groups']
         }
 
-        # 모든 파라미터 이름을 수집합니다.
         all_param_keys = set()
         for state in all_states:
             if state and 'state' in state:
                 all_param_keys.update(state['state'].keys())
 
-        # 각 파라미터에 대해 모든 GPU의 상태를 병합합니다.
         for param_key in all_param_keys:
             merged_state['state'][param_key] = {}
             
-            # 해당 파라미터에 대한 모든 상태 키를 모든 랭크에서 수집합니다.
             all_state_keys = set()
             for state in all_states:
                 if state and 'state' in state and param_key in state['state']:
                     all_state_keys.update(state['state'][param_key].keys())
 
-            # 각 상태 키에 대해 값을 병합합니다.
             for state_key in all_state_keys:
-                # 랭크를 순회하며 해당 상태 키에 대한 값을 찾습니다.
-                # 분산된 텐서(예: factor_matrices)는 하나의 랭크에만 존재할 수 있으므로,
-                # 찾은 첫 번째 유효한 값을 사용합니다.
                 for state in all_states:
                     if state and 'state' in state and param_key in state['state'] and state_key in state['state'][param_key]:
                         value = state['state'][param_key][state_key]
-                        # 텐서인 경우, 빈 텐서가 아닌 유효한 값을 찾으면 병합하고 루프를 중단합니다.
                         if isinstance(value, torch.Tensor):
                             if value.numel() > 0:
                                 merged_state['state'][param_key][state_key] = value
                                 break
-                        # 텐서가 아닌 경우(예: 스텝 카운터), 값을 병합하고 루프를 중단합니다.
                         else:
                             merged_state['state'][param_key][state_key] = value
                             break
@@ -451,16 +455,14 @@ def gather_optimizer_state_from_all_ranks(optimizer, model, world_size):
     return None
 
 
-def save_checkpoint(model, optimizer, epoch, step, best_bleu, checkpoint_path, global_rank, world_size, args):
-    """Save checkpoint with both standard format and Shampoo metadata."""
-
-    # 모든 GPU의 옵티마이저 상태를 수집
+def save_checkpoint(model, optimizer, epoch, step, best_bleu, checkpoint_path, 
+                   global_rank, world_size, args, cumulative_fallback_count):
+    """체크포인트 저장"""
     merged_optimizer_state = gather_optimizer_state_from_all_ranks(optimizer, model, world_size)
 
     if global_rank == 0 and merged_optimizer_state is not None:
         actual_model = model.module if hasattr(model, 'module') else model
 
-        # Shampoo 설정 메타데이터
         shampoo_config = {
             'beta2': args.beta2,
             'epsilon': 1e-8,
@@ -473,17 +475,20 @@ def save_checkpoint(model, optimizer, epoch, step, best_bleu, checkpoint_path, g
             'epoch': epoch,
             'step': step,
             'model_state_dict': actual_model.state_dict(),
-            'optimizer_state_dict': merged_optimizer_state, # 병합된 상태 저장
+            'optimizer_state_dict': merged_optimizer_state,
             'best_bleu': best_bleu,
+            'cumulative_fallback_count': cumulative_fallback_count,
             'shampoo_config': shampoo_config,
             'args': vars(args),
         }
 
         torch.save(checkpoint, checkpoint_path)
         print(f"Checkpoint saved to {checkpoint_path}")
+        print(f"  Cumulative FP32→FP64 fallbacks: {cumulative_fallback_count}")
 
 
 def setup():
+    """분산 학습 초기화"""
     dist.init_process_group(backend="nccl", init_method="env://")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -491,6 +496,7 @@ def setup():
 
 
 def cleanup():
+    """분산 학습 종료"""
     dist.destroy_process_group()
 
 
@@ -500,6 +506,15 @@ def main(args):
     world_size = dist.get_world_size()
     print(f"Running DDP on rank {global_rank}/{world_size}, local rank {local_rank}")
 
+    # Eigh fallback 카운터 설정
+    eigh_fallback_handler = EighFallbackCounter()
+    matrix_logger = logging.getLogger('optimizers.matrix_functions')
+    matrix_logger.setLevel(logging.WARNING)
+    matrix_logger.addHandler(eigh_fallback_handler)
+    
+    # 누적 카운트 추적
+    cumulative_fallback_count = 0
+    
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=args.log_dir) if global_rank == 0 else None
@@ -525,19 +540,27 @@ def main(args):
         precondition_frequency=args.precondition_frequency,
         start_preconditioning_step=args.start_preconditioning_step,
         use_decoupled_weight_decay=True,
-        grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-8),
+        grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-7),
         distributed_config=DDPShampooConfig(
             communication_dtype=CommunicationDType.FP32,
             num_trainers_per_group=-1,
             communicate_params=False
-        )
+        ),
+        use_protected_eigh=True
     )
 
     global_step, best_bleu = 0, 0
+    
+    # 학습 루프
     for epoch in range(args.epochs):
         args.current_epoch = epoch
+        
+        # 에폭별 카운트를 위해 리셋
+        eigh_fallback_handler.count = 0
+        
         if global_rank == 0:
-            print(f"\n{'='*50}\nEpoch {epoch+1}/{args.epochs}\n{'='*50}")
+            print(f"\n{'='*80}\nEpoch {epoch+1}/{args.epochs}\n{'='*80}")
+        
         train_loader.sampler.set_epoch(epoch)
 
         start_time = time.time()
@@ -545,48 +568,81 @@ def main(args):
             model, train_loader, optimizer, local_rank, args, global_step, writer, global_rank
         )
         train_time = time.time() - start_time
-
+        
         val_loss = evaluate(model, val_loader, device=local_rank, tokenizer=tokenizer)
+        
         bleu_score = 0.0
         if (epoch + 1) % args.bleu_interval == 0:
             bleu_score = compute_bleu(model, val_loader, local_rank, tokenizer, args.max_seq_len)
-
+        
+        # Fallback 카운트 집계
+        local_fallback_count = torch.tensor(eigh_fallback_handler.count).to(local_rank)
+        epoch_fallback_count = local_fallback_count.clone()
+        dist.all_reduce(epoch_fallback_count, op=dist.ReduceOp.SUM)
+        
+        # 누적 카운트 업데이트
+        cumulative_fallback_count += epoch_fallback_count.item()
+        
+        # 메트릭 집계
         metrics_tensor = torch.tensor([train_loss, val_loss, bleu_score], device=local_rank)
-        dist.all_reduce(metrics_tensor, op=dist.ReduceOp.AVG)
+        dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+        metrics_tensor /= world_size
         train_loss, val_loss, bleu_score = metrics_tensor.tolist()
 
+        # 결과 출력 및 로깅
         if global_rank == 0:
             lr = optimizer.param_groups[0]['lr']
-            print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"BLEU: {bleu_score:.2f} | LR: {lr:.6f} | Time: {train_time:.1f}s")
-
+            print(f"\nEpoch [{epoch+1}/{args.epochs}] Summary:")
+            print(f"  Training Loss: {train_loss:.4f}")
+            print(f"  Validation Loss: {val_loss:.4f}")
+            print(f"  BLEU Score: {bleu_score:.2f}")
+            print(f"  Learning Rate: {lr:.6f}")
+            print(f"  Training Time: {train_time:.1f}s")
+            print(f"  Epoch FP32→FP64 Fallbacks: {epoch_fallback_count.item()}")
+            print(f"  Cumulative Fallbacks: {cumulative_fallback_count}")
+            print(f"{'='*80}\n")
+            
             if writer:
-                writer.add_scalar('Train/Loss', train_loss, global_step)
-                writer.add_scalar('Val/Loss', val_loss, global_step)
+                writer.add_scalar('Loss/train', train_loss, epoch)
+                writer.add_scalar('Loss/validation', val_loss, epoch)
+                writer.add_scalar('Diagnostics/Eigh_Fallback_Per_Epoch', epoch_fallback_count.item(), epoch)
+                writer.add_scalar('Diagnostics/Eigh_Fallback_Cumulative', cumulative_fallback_count, epoch)
                 if (epoch + 1) % args.bleu_interval == 0:
-                    writer.add_scalar('Val/BLEU', bleu_score, global_step)
-                writer.add_scalar('Train/LearningRate', lr, global_step)
+                    writer.add_scalar('Performance/BLEU', bleu_score, epoch)
+                writer.add_scalar('LearningRate/lr', lr, global_step)
 
+        # Best model 저장
         if bleu_score > best_bleu:
             best_bleu = bleu_score
             if global_rank == 0:
                 print(f"*** New best BLEU: {best_bleu:.2f} ***")
             save_checkpoint(model, optimizer, epoch, global_step, best_bleu,
                           os.path.join(args.checkpoint_dir, "best_model.pth"),
-                          global_rank, world_size, args)
+                          global_rank, world_size, args, cumulative_fallback_count)
 
+        # Condition analysis 체크포인트
         if (epoch + 1) % args.condition_analysis_interval == 0:
             save_checkpoint(model, optimizer, epoch, global_step, best_bleu,
                           os.path.join(args.checkpoint_dir, f"condition_epoch_{epoch+1}.pth"),
-                          global_rank, world_size, args)
+                          global_rank, world_size, args, cumulative_fallback_count)
 
+        # 정기 체크포인트
         if (epoch + 1) % args.save_interval == 0:
             save_checkpoint(model, optimizer, epoch, global_step, best_bleu,
                           os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth"),
-                          global_rank, world_size, args)
+                          global_rank, world_size, args, cumulative_fallback_count)
 
+    # 학습 완료
     if global_rank == 0:
-        print(f"\n{'='*50}\nTraining completed! Best BLEU score: {best_bleu:.2f}\n{'='*50}")
+        print(f"\n{'='*80}")
+        print(f"Training completed!")
+        print(f"  Best BLEU score: {best_bleu:.2f}")
+        print(f"  Total FP32→FP64 fallbacks: {cumulative_fallback_count}")
+        print(f"{'='*80}\n")
+        if writer:
+            writer.add_text('Summary/Best_BLEU', str(best_bleu))
+            writer.add_text('Summary/Total_Fallbacks', str(cumulative_fallback_count))
+            
     if writer:
         writer.close()
     cleanup()
@@ -607,7 +663,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=90, help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=128, help='Batch size per GPU')
     parser.add_argument('--lr', type=float, default=0.0013, help='Base learning rate')
-    parser.add_argument('--warmup-steps', type=int, default=34605, help='Warmup steps')
+    parser.add_argument('--warmup-steps', type=int, default=26400, help='Warmup steps')
     parser.add_argument('--weight-decay', type=float, default=0.001, help='Weight decay')
     parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
     parser.add_argument('--beta2', type=float, default=0.99, help='Adam beta2')
@@ -617,15 +673,15 @@ if __name__ == '__main__':
     # Shampoo arguments
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024,
                        help='Max preconditioner dimension')
-    parser.add_argument('--precondition-frequency', type=int, default=25,
+    parser.add_argument('--precondition-frequency', type=int, default=20,
                        help='Preconditioning frequency')
-    parser.add_argument('--start-preconditioning-step', type=int, default=25,
+    parser.add_argument('--start-preconditioning-step', type=int, default=20,
                        help='Step to start preconditioning')
 
     # Data arguments
     parser.add_argument('--data-path', type=str, default='./wmt_data',
                        help='Path to cache datasets')
-    parser.add_argument('--workers', type=int, default=4, help='Number of data workers')
+    parser.add_argument('--workers', type=int, default=6, help='Number of data workers')
     parser.add_argument('--max-train-samples', type=int, default=None,
                        help='Max training samples for debugging')
 
@@ -637,9 +693,9 @@ if __name__ == '__main__':
     parser.add_argument('--save-interval', type=int, default=1, help='Save checkpoint interval')
     parser.add_argument('--bleu-interval', type=int, default=5, help='BLEU evaluation interval')
     parser.add_argument('--condition-analysis-interval', type=int, default=1,
-                       help='Interval for saving checkpoints for condition number analysis')
+                       help='Interval for condition number analysis checkpoints')
     parser.add_argument('--log-condition-interval', type=int, default=100,
-                       help='Interval for logging condition numbers to TensorBoard')
+                       help='Interval for logging condition numbers')
 
     args = parser.parse_args()
     main(args)

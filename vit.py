@@ -8,7 +8,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-
+import logging
 from typing import Dict, List
 import math
 import argparse
@@ -32,6 +32,17 @@ from optimizers.distributed_shampoo.shampoo_types import (
     DDPShampooConfig,
     CommunicationDType
 )
+
+class EighFallbackCounter(logging.Handler):
+    """'eigh' 연산이 float64로 재시도될 때 발생하는 경고를 카운트합니다."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.count = 0
+
+    def emit(self, record):
+        # 로그 메시지에 특정 문자열이 포함되어 있는지 확인
+        if "Retrying in double precision..." in self.format(record):
+            self.count += 1
 
 # --- ViT 모델 코드 수정 ---
 
@@ -364,18 +375,18 @@ def train(args: argparse.Namespace):
         model.parameters(),
         lr=args.base_lr,
         betas=(args.beta1, 0.99),
-        epsilon=0.05,
+        epsilon=1e-08,
         momentum=False,
         weight_decay=args.weight_decay,
         max_preconditioner_dim=1024,
-        precondition_frequency=100,
+        precondition_frequency=20,
         use_normalized_grafting=False,
         inv_root_override=2,
         exponent_multiplier=1,
-        start_preconditioning_step=100,
+        start_preconditioning_step=20,
         use_nadam=False,
         use_decoupled_weight_decay=True,
-        grafting_config=AdamGraftingConfig(beta2=0.99, epsilon=1e-6),
+        grafting_config=AdamGraftingConfig(beta2=0.99, epsilon=1e-07),
         distributed_config=DDPShampooConfig(
             communication_dtype = CommunicationDType.FP32,
             num_trainers_per_group = -1,
@@ -384,6 +395,8 @@ def train(args: argparse.Namespace):
     )
     
     start_epoch = 0
+    eigh_fallback_handler = EighFallbackCounter()
+    logging.getLogger('optimizers.matrix_functions').addHandler(eigh_fallback_handler)
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"=> loading checkpoint '{args.resume}'")
@@ -412,7 +425,7 @@ def train(args: argparse.Namespace):
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
         model.train()
-        
+        running_loss = 0.0
         for i, batch in enumerate(train_loader):
             current_step = epoch * len(train_loader) + i
             images = batch['pixel_values'].to(local_rank, non_blocking=True)
@@ -430,13 +443,18 @@ def train(args: argparse.Namespace):
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-
+            running_loss += loss.item()
             if global_rank == 0 and (i + 1) % args.log_interval == 0:
                 print(f"Epoch [{epoch+1}/{args.epochs}], Step [{i+1}/{len(train_loader)}], LR: {new_lr:.6f}, Loss: {loss.item():.4f}")
                 if writer:
-                    writer.add_scalar('training_loss', loss.item(), current_step)
                     writer.add_scalar('learning_rate', new_lr, current_step)
-        
+        total_loss_tensor = torch.tensor(running_loss).to(local_rank)
+        dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
+        avg_epoch_loss = total_loss_tensor.item()/world_size/len(train_loader)
+        if global_rank == 0 :
+            if writer:
+                writer.add_scalar('training_loss', avg_epoch_loss, epoch)
+                
         model.eval()
         correct = 0 
         total = 0
@@ -471,26 +489,27 @@ def train(args: argparse.Namespace):
             if writer:
                 writer.add_scalar('validation_accuracy', accuracy, epoch)
                 writer.add_scalar('validation_loss', avg_val_loss, epoch)
-
+                writer.add_scalar('Diagnostics/Eigh_Fallback_Count', eigh_fallback_handler.count, epoch)
         if (epoch + 1) % args.save_interval == 0:
             print(f"Rank {global_rank}: Gathering optimizer states for checkpoint...")
             merged_optimizer_state = gather_optimizer_state_from_all_ranks(optimizer, model, global_rank, world_size)
-    
+            
             if global_rank == 0:
                 # 체크포인트 검증
                 validate_checkpoint_completeness(merged_optimizer_state, model.module)
         
                 save_path = os.path.join(args.save_dir, f"vit_checkpoint_epoch_{epoch+1}.pth")
                 print(f"Saving merged checkpoint to {save_path}")
-        
+                total_fallbacks = eigh_fallback_handler.count
+                print(f"Total torch.linalg.eigh fallbacks to float64: {total_fallbacks}")
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.module.state_dict(),
                     'optimizer_state_dict': merged_optimizer_state,
                 }, save_path)
-    
+                
             dist.barrier()
-
+    
     if writer:
         writer.close()
     cleanup()

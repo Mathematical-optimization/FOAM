@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from itertools import chain
-from typing import Any, DefaultDict, Sequence, Tuple, Union
+from typing import Any, DefaultDict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -498,6 +498,8 @@ class ShampooPreconditionerList(PreconditionerList):
         distributor_selector: Tuple[bool, ...],
         beta2: float = 1.0,
         epsilon: float = 1e-12,
+        epsilon_left : Optional[float] = None,
+        epsilon_right : Optional[float] = None,
         inv_root_override: Union[int, Tuple[int, ...]] = 0,
         exponent_multiplier: float = 1.0,
         use_bias_correction: bool = True,
@@ -509,6 +511,8 @@ class ShampooPreconditionerList(PreconditionerList):
         # Initialize parameters.
         self._beta2 = beta2
         self._epsilon = epsilon
+        self._epsilon_left = epsilon_left if epsilon_left is not None else epsilon
+        self._epsilon_right = epsilon_right if epsilon_right is not None else epsilon
         self._inv_root_override = inv_root_override
         self._exponent_multiplier = exponent_multiplier
         self._factor_matrix_dtype = factor_matrix_dtype
@@ -522,6 +526,7 @@ class ShampooPreconditionerList(PreconditionerList):
         # This is because the optimizer state is defined per-parameter, but ShampooPreconditionerList is defined
         # across each parameter group (which includes multiple parameters).
         kronecker_factors_list = []
+        epsilon_per_dim_list = []
         for block, block_info, dims in zip(
             block_list, block_info_list, self._dims_list, 
         ):
@@ -529,6 +534,22 @@ class ShampooPreconditionerList(PreconditionerList):
             if block_index not in state[block_info.param]:
                 state[block_info.param][block_index] = {}
             block_state = state[block_info.param][block_index]
+
+            block_epsilon_per_dim = []
+            for dim_idx, dim in enumerate(dims):
+                if len(dims) == 1:
+                    block_epsilon_per_dim.append(self._epsilon)
+                elif len(dims) == 2:
+                    if dim_idx == 0:
+                        block_epsilon_per_dim.append(self._epsilon_left)
+                    else:
+                        block_epsilon_per_dim.append(self._epsilon_right)
+                else:
+                    if dim_idx == 0:
+                        block_epsilon_per_dim.append(self._epsilon_left)
+                    else:
+                        block_epsilon_per_dim.append(self._epsilon_right)
+            epsilon_per_dim_list.append(tuple(block_epsilon_per_dim))
 
             # Instantiate ShampooKroneckerFactors for this block.
             # The factor matrices are instantiated using the determined dtype.
@@ -574,6 +595,7 @@ class ShampooPreconditionerList(PreconditionerList):
             logger.info(
                 f"Instantiated Shampoo Preconditioner {preconditioner_index} "
                 f"({[factor_matrix.shape for factor_matrix in block_state[SHAMPOO].factor_matrices]}) "
+                f"with epsilon per dim: {block_epsilon_per_dim} "
                 f"for Parameter {param_index} ({block_info.param.shape}), Block {block_index} ({block.shape})."
             )
 
@@ -582,6 +604,9 @@ class ShampooPreconditionerList(PreconditionerList):
         self._local_kronecker_factors_list: Tuple[
             ShampooKroneckerFactors, ...
         ] = compress_list(kronecker_factors_list, distributor_selector)
+        self._local_epsilon_per_dim_list : Tuple[Tuple[float, ...], ...] = compress_list(
+            epsilon_per_dim_list, distributor_selector
+        )
         self._local_order_list: Tuple[int, ...] = tuple(
             block.dim() for block in local_block_list
         )
@@ -595,7 +620,8 @@ class ShampooPreconditionerList(PreconditionerList):
         self._masked_kronecker_factors_list: Tuple[
             ShampooKroneckerFactors, ...
         ] = self._local_kronecker_factors_list
-
+        self._masked_epsilon_per_dim_list : Tuple[Tuple[float, ...], ...] = self._local_epsilon_per_dim_list
+        
         # Construct lists of bytes and numels for logging purposes.
         # NOTE: These lists are constructed across all blocked parameters.
         self._numel_list: Tuple[int, ...] = tuple(
@@ -732,20 +758,23 @@ class ShampooPreconditionerList(PreconditionerList):
         with profiler.record_function(
             f"## {self.__class__.__name__}:{self.compute_root_inverse.__name__} ##"
         ):
-            for kronecker_factors, root in zip(
+            for kronecker_factors, root, epsilon_per_dim in zip(
                 self._local_kronecker_factors_list,
                 self._local_root_list,
+                self._local_epsilon_per_dim_list,
             ):
                 for (
                     factor_matrix,
                     inv_factor_matrix,
                     is_factor_matrix_diagonal,
                     factor_matrix_index,
+                    epsilon_for_this_dim,
                 ) in zip(
                     kronecker_factors.factor_matrices,
                     kronecker_factors.inv_factor_matrices,
                     kronecker_factors.is_factor_matrices_diagonal,
                     kronecker_factors.factor_matrix_indices,
+                    epsilon_per_dim,
                 ):
                     # For tracking diagonality of the preconditioner.
                     # Checks if the preconditioner is currently diagonal, then checks whether or not
@@ -788,7 +817,8 @@ class ShampooPreconditionerList(PreconditionerList):
                         computed_inv_factor_matrix = matrix_inverse_root(
                             A=bias_corrected_factor_matrix,
                             root=root,
-                            epsilon=self._epsilon,
+                            epsilon=epsilon_for_this_dim,
+                            
                             exponent_multiplier=self._exponent_multiplier,
                             is_diagonal=is_factor_matrix_diagonal,
                             retry_double_precision=self._use_protected_eigh,
@@ -836,7 +866,9 @@ class ShampooPreconditionerList(PreconditionerList):
             self._masked_kronecker_factors_list: Tuple[
                 ShampooKroneckerFactors, ...
             ] = compress_list(self._local_kronecker_factors_list, local_grad_selector)
-
+            self._masked_epsilon_per_dim_list = compress_list(
+                self._local_epsilon_per_dim_list, local_grad_selector
+            )
     def compute_root_inverse_residuals(
         self,
     ) -> Tuple[Tuple[Tensor, ...], Tuple[Tensor, ...]]:
@@ -847,7 +879,7 @@ class ShampooPreconditionerList(PreconditionerList):
             self._masked_kronecker_factors_list,
             self._masked_root_list,
         ):
-            for factor_matrix, inv_factor_matrix in zip(
+            for factor_matrix, inv_factor_matrix, epsilon_for_this_dim in zip(
                 kronecker_factors.factor_matrices,
                 kronecker_factors.inv_factor_matrices,
             ):
@@ -859,7 +891,7 @@ class ShampooPreconditionerList(PreconditionerList):
                     bias_corrected_factor_matrix,
                     inv_factor_matrix,
                     root,
-                    self._epsilon,
+                    epsilon_for_this_dim,
                     self._exponent_multiplier,
                 )
                 relative_errors.append(relative_error)

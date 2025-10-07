@@ -32,6 +32,8 @@ from .shampoo_types import (
     DistributedConfig,
     DISTRIBUTOR,
     EPSILON,
+    EPSILON_LEFT,
+    EPSILON_RIGHT,
     EXPONENT_MULTIPLIER,
     FILTERED_GRAD,
     FILTERED_GRAD_LIST,
@@ -268,6 +270,8 @@ class DistributedShampoo(torch.optim.Optimizer):
         lr: float = 1e-2,
         betas: Tuple[float, float] = (0.9, 1.0),
         epsilon: float = 1e-12,
+        epsilon_left : Optional[float] = None,
+        epsilon_right : Optional[float] =None,
         momentum: float = 0.0,
         weight_decay: float = 0.0,
         max_preconditioner_dim: int = 1024,
@@ -302,6 +306,8 @@ class DistributedShampoo(torch.optim.Optimizer):
             )
         if not epsilon > 0.0:
             raise ValueError(f"Invalid epsilon value: {epsilon}. Must be > 0.0.")
+        actual_epsilon_left = epsilon_left if epsilon_left is not None else epsilon
+        actual_epsilon_right = epsilon_right if epsilon_right is not None else epsilon
         if not 0.0 <= momentum < 1.0:
             raise ValueError(
                 f"Invalid momentum parameter: {momentum}. Must be [0.0, 1.0)."
@@ -373,6 +379,8 @@ class DistributedShampoo(torch.optim.Optimizer):
                 LR: lr,
                 BETAS: betas,
                 EPSILON: epsilon,
+                EPSILON_LEFT : actual_epsilon_left,
+                EPSILON_RIGHT: actual_epsilon_right,
                 MOMENTUM: momentum,
                 WEIGHT_DECAY: weight_decay,
                 MAX_PRECONDITIONER_DIM: max_preconditioner_dim,
@@ -483,6 +491,8 @@ class DistributedShampoo(torch.optim.Optimizer):
                 distributor_selector=state_lists[DISTRIBUTOR].distributor_selector,
                 beta2=group[BETAS][1],
                 epsilon=group[EPSILON],
+                epsilon_left = group[EPSILON_LEFT],
+                epsilon_right = group[EPSILON_RIGHT],
                 inv_root_override=group[INV_ROOT_OVERRIDE],
                 exponent_multiplier=group[EXPONENT_MULTIPLIER],
                 use_bias_correction=group[USE_BIAS_CORRECTION],

@@ -822,7 +822,7 @@ class ShampooPreconditionerList(PreconditionerList):
                     # If reuse_previous_inv_factor_matrix is True, will reuse previous matrix if matrix
                     # inverse root computation fails.
                     try:
-                        computed_inv_factor_matrix, used_epsilon = matrix_inverse_root(
+                        result = matrix_inverse_root(
                             A=bias_corrected_factor_matrix,
                             root=root,
                             epsilon=epsilon_for_this_dim,
@@ -831,8 +831,9 @@ class ShampooPreconditionerList(PreconditionerList):
                             exponent_multiplier=self._exponent_multiplier,
                             is_diagonal=is_factor_matrix_diagonal,
                             retry_double_precision=self._use_protected_eigh,
-                        ).to(dtype=inv_factor_matrix.dtype)
-
+                        )
+                        computed_inv_factor_matrix, used_epsilon = result
+                        computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype = inv_factor_matrix.dtype)
                         if self._use_adaptive_epsilon and used_epsilon != epsilon_for_this_dim:
                             if factor_matrix_index not in self._condition_numbers:
                                 self._condition_numbers[factor_matrix_index] = []
@@ -840,7 +841,7 @@ class ShampooPreconditionerList(PreconditionerList):
                             logger.debug(f"Factor matrix {factor_matrix_index}:"
                                          f"Original epsilon = {epsilon_for_this_dim:.2e},"
                                          f"Adjusted epsilon = {used_epsilon:.2e}")
-                        computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype = inv_factor_matrix.dtype)
+                        
                         
                         # Check if we encounter NaN or inf values in computed inverse matrix.
                         if (

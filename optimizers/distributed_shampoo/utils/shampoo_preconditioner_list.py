@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from itertools import chain
-from typing import Any, DefaultDict, Optional, Sequence, Tuple, Union
+from typing import Any, DefaultDict, Optional, Sequence, List, Tuple, Union, Dict
 
 import torch
 import torch.distributed as dist
@@ -497,9 +497,11 @@ class ShampooPreconditionerList(PreconditionerList):
         block_info_list: Tuple[BlockInfo, ...],
         distributor_selector: Tuple[bool, ...],
         beta2: float = 1.0,
-        epsilon: float = 1e-12,
+        epsilon: float = 1e-10,
         epsilon_left : Optional[float] = None,
         epsilon_right : Optional[float] = None,
+        use_adaptive_epsilon:bool=False,
+        condition_thresholds: Optional[Dict[float, float]] = None,
         inv_root_override: Union[int, Tuple[int, ...]] = 0,
         exponent_multiplier: float = 1.0,
         use_bias_correction: bool = True,
@@ -513,6 +515,12 @@ class ShampooPreconditionerList(PreconditionerList):
         self._epsilon = epsilon
         self._epsilon_left = epsilon_left if epsilon_left is not None else epsilon
         self._epsilon_right = epsilon_right if epsilon_right is not None else epsilon
+        self._use_adaptive_epsilon = use_adaptive_epsilon
+        self._condition_thresholds = condition_thresholds or {
+            1e6:1e-5,
+            1e8:5e-5,
+        }
+        self._condition_numbers: Dict[str, List[float]] = {}
         self._inv_root_override = inv_root_override
         self._exponent_multiplier = exponent_multiplier
         self._factor_matrix_dtype = factor_matrix_dtype
@@ -814,16 +822,26 @@ class ShampooPreconditionerList(PreconditionerList):
                     # If reuse_previous_inv_factor_matrix is True, will reuse previous matrix if matrix
                     # inverse root computation fails.
                     try:
-                        computed_inv_factor_matrix = matrix_inverse_root(
+                        computed_inv_factor_matrix, used_epsilon = matrix_inverse_root(
                             A=bias_corrected_factor_matrix,
                             root=root,
                             epsilon=epsilon_for_this_dim,
-                            
+                            use_adaptive_epsilon = self._use_adaptive_epsilon,
+                            condition_thresholds = self._condition_thresholds,
                             exponent_multiplier=self._exponent_multiplier,
                             is_diagonal=is_factor_matrix_diagonal,
                             retry_double_precision=self._use_protected_eigh,
                         ).to(dtype=inv_factor_matrix.dtype)
 
+                        if self._use_adaptive_epsilon and used_epsilon != epsilon_for_this_dim:
+                            if factor_matrix_index not in self._condition_numbers:
+                                self._condition_numbers[factor_matrix_index] = []
+
+                            logger.debug(f"Factor matrix {factor_matrix_index}:"
+                                         f"Original epsilon = {epsilon_for_this_dim:.2e},"
+                                         f"Adjusted epsilon = {used_epsilon:.2e}")
+                        computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype = inv_factor_matrix.dtype)
+                        
                         # Check if we encounter NaN or inf values in computed inverse matrix.
                         if (
                             torch.isnan(computed_inv_factor_matrix).any()

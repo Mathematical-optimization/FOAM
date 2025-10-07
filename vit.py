@@ -401,6 +401,7 @@ def train(args: argparse.Namespace):
         model.parameters(),
         lr=args.base_lr,
         betas=(args.beta1, 0.99),
+        epsilon = 1e-10, # 1D Tensor용.
         epsilon_left = 1e-8, #L matrix epsilon
         epsilon_right = 5e-5,  # R matrix epsilon
         use_adaptive_epsilon = True,

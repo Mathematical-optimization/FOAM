@@ -318,6 +318,83 @@ def apply_transforms(examples: Dict[str, List[Image.Image]], transform) -> Dict[
     examples['pixel_values'] = [transform(image.convert("RGB")) for image in examples['image']]
     return examples
 
+def get_epsilon_config(args):
+    """
+    Epsilon 설정을 프리셋 또는 커스텀 값으로부터 생성
+    
+    Returns:
+        dict: Shampoo optimizer에 전달할 epsilon 관련 파라미터
+    """
+    config = {}
+    
+    # 프리셋 설정
+    presets = {
+        'default': {
+            'epsilon': 1e-08,
+            'epsilon_left': None,  # None이면 epsilon 값 사용
+            'epsilon_right': None,
+            'use_adaptive_epsilon': False,
+            'condition_thresholds': None
+        },
+        'asymmetric': {
+            'epsilon': 1e-08,
+            'epsilon_left': 1e-8,
+            'epsilon_right': 5e-5,
+            'use_adaptive_epsilon': False,
+            'condition_thresholds': None
+        },
+        'adaptive': {
+            'epsilon': 1e-08,
+            'epsilon_left': None,
+            'epsilon_right': None,
+            'use_adaptive_epsilon': True,
+            'condition_thresholds': {1e6: 1e-5, 1e8: 5e-5}
+        },
+        'adaptive_asymmetric': {
+            'epsilon': 1e-08,
+            'epsilon_left': 1e-8,
+            'epsilon_right': 5e-5,
+            'use_adaptive_epsilon': True,
+            'condition_thresholds': {1e6: 1e-5, 1e8: 5e-5}
+        }
+    }
+    
+    if args.epsilon_preset == 'custom':
+        # 커스텀 설정: 명령행 인자 사용
+        config['epsilon'] = args.epsilon
+        config['epsilon_left'] = args.epsilon_left
+        config['epsilon_right'] = args.epsilon_right
+        config['use_adaptive_epsilon'] = args.use_adaptive_epsilon
+        
+        # condition_thresholds 파싱
+        if args.use_adaptive_epsilon and args.condition_thresholds:
+            thresholds = {}
+            for pair in args.condition_thresholds.split(','):
+                threshold, epsilon = pair.split(':')
+                thresholds[float(threshold)] = float(epsilon)
+            config['condition_thresholds'] = thresholds
+        else:
+            config['condition_thresholds'] = None
+    else:
+        # 프리셋 사용
+        config = presets[args.epsilon_preset].copy()
+    
+    # 로깅
+    if dist.get_rank() == 0:
+        print("\n" + "="*60)
+        print("EPSILON CONFIGURATION")
+        print("="*60)
+        print(f"Preset: {args.epsilon_preset}")
+        print(f"Base epsilon (1D): {config['epsilon']}")
+        print(f"Left matrix epsilon: {config.get('epsilon_left', 'Same as base')}")
+        print(f"Right matrix epsilon: {config.get('epsilon_right', 'Same as base')}")
+        print(f"Adaptive epsilon: {config['use_adaptive_epsilon']}")
+        if config.get('condition_thresholds'):
+            print(f"Condition thresholds: {config['condition_thresholds']}")
+        print("="*60 + "\n")
+    
+    return config
+
 # --- 메인 학습 함수 ---
         
 def train(args: argparse.Namespace):
@@ -395,20 +472,18 @@ def train(args: argparse.Namespace):
 
     # 손실 함수
     criterion = nn.CrossEntropyLoss().to(local_rank)
+    epsilon_config = get_epsilon_config(args)
 
     # 옵티마이저 설정
     optimizer = DistributedShampoo(
         model.parameters(),
         lr=args.base_lr,
         betas=(args.beta1, 0.99),
-        epsilon = 1e-10, # 1D Tensor용.
-        epsilon_left = 1e-8, #L matrix epsilon
-        epsilon_right = 5e-5,  # R matrix epsilon
-        use_adaptive_epsilon = True,
-        condition_thresholds={
-        1e6: 1e-5,
-        1e8: 5e-5,
-    },
+        epsilon = epsilon_config['epsilon'], # 1D Tensor용.
+        epsilon_left = epsilon_config.get('epsilon_left'), #L matrix epsilon
+        epsilon_right = epsilon_config.get('epsilon_right'),  # R matrix epsilon
+        use_adaptive_epsilon = epsilon_config['use_adaptive_epsilon'],
+        condition_thresholds=epsilon_config.get('condition_thresholds'),
         momentum=False,
         weight_decay=args.weight_decay,
         max_preconditioner_dim=1024,
@@ -619,6 +694,12 @@ if __name__ == '__main__':
     parser.add_argument('--beta1', type=float, default=0.95, help='Beta1/Momentum (default: 0.95)')
     parser.add_argument('--save-dir', type=str, default='checkpoints', help='Directory for saving checkpoints')
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
-
+    
+    parser.add_argument('--epsilon-preset', type = str, default = 'default', choices = ['default', 'asymmetric', 'adpative', 'adaptive_asymmetric' ], help = 'Epsilon configuration preset')
+    parser.add_argument('--epsilon', type= float, default = 1e-08)
+    parser.add_argument('--epsilon-left', type = float, default = None)
+    parser.add_argument('--epsilon-right', type = float, default = None)
+    parser.add_argument('--use-adaptive-epsilon', action = 'store_true')
+    parser.add_argument('--condition-thresholds', type = str, default= '1e6:1e-5, 1e8:5e-5')
     args = parser.parse_args()
     train(args)

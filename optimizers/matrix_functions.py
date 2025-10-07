@@ -113,7 +113,7 @@ def matrix_inverse_root(
     # check if matrix is scalar
     if torch.numel(A) == 1:
         alpha = torch.as_tensor(-exponent_multiplier / root)
-        return (A + epsilon) ** alpha
+        return (A + epsilon) ** alpha, epsilon
 
     # check matrix shape
     if len(A.shape) != 2:
@@ -133,7 +133,7 @@ def matrix_inverse_root(
             return_full_matrix=True,
         )
     elif root_inv_method == RootInvMethod.EIGEN:
-        X, _, _ = _matrix_root_eigen(
+        X, _, _, used_epsilon, _ = _matrix_root_eigen(
             A=A,
             root=root,
             epsilon=epsilon,
@@ -283,7 +283,7 @@ def _matrix_root_eigen(
         if adjusted_epsilon != epsilon:
             logger.debug(f'Adjusted epsilon from {epsilon:.2e} to {adjusted_epsilon:.2e}'
                          f"due to condition number {condition_number:.2e}")
-    used_epsilon = adjusted_epsilon
+            used_epsilon = adjusted_epsilon
     # add epsilon
     L += used_epsilon
 

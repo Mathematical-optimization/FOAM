@@ -9,7 +9,7 @@ LICENSE file in the root directory of this source tree.
 
 import enum
 import logging
-from typing import Tuple, Union
+from typing import Tuple, Union, Optional, Dict
 
 import torch
 from torch import Tensor
@@ -40,6 +40,39 @@ def check_diagonal(A: Tensor) -> bool:
     # Check both upper triangular part and lower triangular part are all zeros.
     return not A.triu(diagonal=1).any() and not A.tril(diagonal=-1).any()
 
+def compute_condition_based_epsilon(
+        eigenvalues : Tensor,
+        base_epsilon : float,
+        condition_thresholds : Optional[Dict[float, float,]] = None
+) -> float:
+    """
+    조건수에 기반하여 epsilon을 적응적으로 조정함.
+
+    condition_thresholds : 조건수 임계값과 epsilon 매핑 
+    기본값 : {1e6 : 1e-05, 1e8 : 5e-5}
+
+    조정된 epsilon 값 반환.
+    """
+    if condition_thresholds is None:
+        condition_thresholds = {
+            1e6 : 1e-5,
+            1e8: 5e-5,
+        }
+    max_eigenvalue = torch.max(eigenvalues)
+    min_eigenvalue = torch.min(eigenvalues)
+
+    if min_eigenvalue <= 0:
+        min_eigenvalue = torch.min(eigenvalues[eigenvalues > 0]) if torch.any(eigenvalues > 0) else 1e-09
+
+    condition_number = max_eigenvalue/min_eigenvalue
+
+    adjusted_epsilon = base_epsilon
+    for threshold, epsilon_value in sorted(condition_thresholds.items()):
+        if condition_number >= threshold:
+            adjusted_epsilon = epsilon_value
+        else:
+            break
+    return adjusted_epsilon, condition_number.item()
 
 def matrix_inverse_root(
     A: Tensor,
@@ -51,7 +84,9 @@ def matrix_inverse_root(
     tolerance: float = 1e-6,
     is_diagonal: Union[Tensor, bool] = False,
     retry_double_precision: bool = True,
-) -> Tensor:
+    use_adaptive_epsilon: bool = False,
+    condition_thresholds : Optional[Dict[float, float]] = None,
+) -> Tuple[Tensor, float]:
     """Computes matrix root inverse of square symmetric positive definite matrix.
 
     Args:
@@ -66,9 +101,12 @@ def matrix_inverse_root(
             root inverse of diagonal entries. (Default: False)
         retry_double_precision (bool): Flag for re-trying eigendecomposition with higher precision if lower precision fails due
             to CuSOLVER failure. (Default: True)
+        use_adaptive_epsilon : 조건수 기반 epsilon 조정 사용 여부
+        condition_thresholds : 조건수 임계값과 epsilon 매핑
 
     Returns:
         X (Tensor): Inverse root of matrix A.
+        used_epsilon : 실제 사용된 epsilon 값.
 
     """
 
@@ -82,12 +120,14 @@ def matrix_inverse_root(
         raise ValueError("Matrix is not 2-dimensional!")
     elif A.shape[0] != A.shape[1]:
         raise ValueError("Matrix is not square!")
+    
+    used_epsilon = epsilon
 
     if is_diagonal:
         X = matrix_root_diagonal(
             A=A,
             root=root,
-            epsilon=epsilon,
+            epsilon=used_epsilon,
             inverse=True,
             exponent_multiplier=exponent_multiplier,
             return_full_matrix=True,
@@ -100,8 +140,11 @@ def matrix_inverse_root(
             inverse=True,
             exponent_multiplier=exponent_multiplier,
             retry_double_precision=retry_double_precision,
+            use_adaptive_epsilon = use_adaptive_epsilon,
+            condition_thresholds = condition_thresholds,
         )
     elif root_inv_method == RootInvMethod.NEWTON:
+        # Newton method는 adaptive epsilon 미지원.
         if exponent_multiplier != 1.0:
             raise ValueError(
                 f"Exponent multiplier {exponent_multiplier} must be equal to 1 to use coupled inverse Newton iteration!"
@@ -123,7 +166,7 @@ def matrix_inverse_root(
             f"Root inverse method is not implemented! Specified root inverse method is {str(root_inv_method)}."
         )
 
-    return X
+    return X, used_epsilon
 
 
 def matrix_root_diagonal(
@@ -176,7 +219,9 @@ def _matrix_root_eigen(
     exponent_multiplier: float = 1.0,
     make_positive_semidefinite: bool = True,
     retry_double_precision: bool = True,
-) -> Tuple[Tensor, Tensor, Tensor]:
+    use_adaptive_epsilon : bool = False,
+    condition_thresholds: Optional[Dict[float, float]] = None,
+) -> Tuple[Tensor, Tensor, Tensor, float, float]:
     """Compute matrix (inverse) root using eigendecomposition of symmetric positive (semi-)definite matrix.
 
             A = Q L Q^T => A^{1/r} = Q L^{1/r} Q^T OR A^{-1/r} = Q L^{-1/r} Q^T
@@ -228,13 +273,24 @@ def _matrix_root_eigen(
     if make_positive_semidefinite:
         L += -torch.minimum(lambda_min, torch.as_tensor(0.0))
 
+    used_epsilon = epsilon
+    condition_number = float('inf')
+
+    if use_adaptive_epsilon and torch.numel(L) > 1:
+        adjusted_epsilon, condition_number = compute_condition_based_epsilon(
+            L, epsilon, condition_thresholds
+        )
+        if adjusted_epsilon != epsilon:
+            logger.debug(f'Adjusted epsilon from {epsilon:.2e} to {adjusted_epsilon:.2e}'
+                         f"due to condition number {condition_number:.2e}")
+    used_epsilon = adjusted_epsilon
     # add epsilon
-    L += epsilon
+    L += used_epsilon
 
     # compute inverse preconditioner
     X = Q * L.pow(alpha).unsqueeze(0) @ Q.T
 
-    return X, L, Q
+    return X, L, Q, used_epsilon, condition_number
 
 
 def _matrix_inverse_root_newton(

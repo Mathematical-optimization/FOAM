@@ -520,11 +520,15 @@ class ShampooPreconditionerList(PreconditionerList):
             1e6:1e-5,
             1e8:5e-5,
         }
+        self._thresholds_tensor = None
+        self._epsilons_tensor = None
+        self._thresholds_keys = []
+        self._thresholds_values =[]
+        self._small_positive_tensor = None
+        self._base_epsilon_tensor = None
         if self._use_adaptive_epsilon:
             self._thresholds_keys = sorted(self._condition_thresholds.keys())
             self._thresholds_values = [self._condition_thresholds[k] for k in self._thresholds_keys]
-            self._thresholds_tensor = None
-            self._epsilon_tensor = None
         self._condition_numbers: Dict[str, List[float]] = {}
         self._inv_root_override = inv_root_override
         self._exponent_multiplier = exponent_multiplier
@@ -532,7 +536,7 @@ class ShampooPreconditionerList(PreconditionerList):
         self._use_bias_correction = use_bias_correction
         self._use_protected_eigh = use_protected_eigh
         self._bias_correction2: Tensor = torch.tensor(1.0)
-
+        
         # Instantiate (blocked) Kronecker factors and construct list of Kronecker factors.
         # NOTE: We need to instantiate the Kronecker factor states within the optimizer's state dictionary,
         # and do not explicitly store them as ShampooPreconditionerList attributes here.
@@ -771,8 +775,8 @@ class ShampooPreconditionerList(PreconditionerList):
         with profiler.record_function(
             f"## {self.__class__.__name__}:{self.compute_root_inverse.__name__} ##"
         ):
-            if self._use_adaptive_epsilon and self._thresholds_tensor is None:
-                if len(self._local_kronecker_factors_list) > 0:
+            if self._use_adaptive_epsilon:
+                if self._thresholds_tensor is None and len(self._local_kronecker_factors_list) > 0:
                     device = self._local_kronecker_factors_list[0].factor_matrices[0].device
                     self._thresholds_tensor = torch.tensor(
                         self._thresholds_keys,
@@ -782,6 +786,16 @@ class ShampooPreconditionerList(PreconditionerList):
                     self._epsilons_tensor = torch.tensor(
                         self._thresholds_values,
                         dtype= torch.float32,
+                        device = device
+                    )
+                    self._small_positive_tensor = torch.tensor(
+                        1e-8,
+                        dtype = torch.float32,
+                        device = device
+                    )
+                    self._base_epsilon_tensor = torch.tensor(
+                        self._epsilon,
+                        dtype = torch.float32,
                         device = device
                     )
             for kronecker_factors, root, epsilon_per_dim in zip(
@@ -840,18 +854,33 @@ class ShampooPreconditionerList(PreconditionerList):
                     # If reuse_previous_inv_factor_matrix is True, will reuse previous matrix if matrix
                     # inverse root computation fails.
                     try:
-                        result = matrix_inverse_root(
-                            A=bias_corrected_factor_matrix,
-                            root=root,
-                            epsilon=epsilon_for_this_dim,
-                            use_adaptive_epsilon = self._use_adaptive_epsilon,
-                            condition_thresholds = self._condition_thresholds,
-                            thresholds_tensor = self._thresholds_tensor,
-                            epsilons_tensor = self._epsilons_tensor,
-                            exponent_multiplier=self._exponent_multiplier,
-                            is_diagonal=is_factor_matrix_diagonal,
-                            retry_double_precision=self._use_protected_eigh,
-                        )
+                        if self._use_adaptive_epsilon:
+                            result = matrix_inverse_root(
+                                A=bias_corrected_factor_matrix,
+                                root=root,
+                                epsilon=epsilon_for_this_dim,
+                                use_adaptive_epsilon = self._use_adaptive_epsilon,
+                                condition_thresholds = self._condition_thresholds,
+                                thresholds_tensor = self._thresholds_tensor,
+                                epsilons_tensor = self._epsilons_tensor,
+                                small_positive_tensor=self._small_positive_tensor,
+                                exponent_multiplier=self._exponent_multiplier,
+                                is_diagonal=is_factor_matrix_diagonal,
+                                retry_double_precision=self._use_protected_eigh,
+                            )
+                        else:
+                            result = matrix_inverse_root(
+                                A=bias_corrected_factor_matrix,
+                                root=root,
+                                epsilon=epsilon_for_this_dim,
+                                use_adaptive_epsilon = False,
+                                condition_thresholds = None,
+                                thresholds_tensor = None,
+                                epsilons_tensor = None,
+                                exponent_multiplier=self._exponent_multiplier,
+                                is_diagonal=is_factor_matrix_diagonal,
+                                retry_double_precision=self._use_protected_eigh,
+                            )
                         computed_inv_factor_matrix, used_epsilon_tensor = result
                         computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype = inv_factor_matrix.dtype)
                         if self._use_adaptive_epsilon and logger.isEnabledFor(logging.DEBUG):

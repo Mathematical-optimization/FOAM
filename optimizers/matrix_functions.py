@@ -39,6 +39,7 @@ def check_diagonal(A: Tensor) -> bool:
 
     # Check both upper triangular part and lower triangular part are all zeros.
     return not A.triu(diagonal=1).any() and not A.tril(diagonal=-1).any()
+
 def compute_condition_based_epsilon(
         eigenvalues : Tensor,
         base_epsilon : float,
@@ -79,6 +80,7 @@ def compute_condition_based_epsilon_gpu(
         base_epsilon : float,
         thresholds_tensor : Tensor,
         epsilons_tensor : Tensor,
+        small_positive_tensor : Optional[Tensor] = None,
 ) -> Tensor:
     """
     조건수에 기반하여 epsilon을 적응적으로 조정함.
@@ -88,20 +90,27 @@ def compute_condition_based_epsilon_gpu(
 
     조정된 epsilon 값 반환.
     """
+    if small_positive_tensor is None:
+        small_positive_tensor = torch.tensor(1e-8, device = eigenvalues.device)
+
     eigenvalues_safe = torch.where(
         eigenvalues >0,
         eigenvalues,
-        torch.full_like(eigenvalues, 1e-9)
+        small_positive_tensor
     )
     max_eig = torch.max(eigenvalues_safe)
     min_eig = torch.min(eigenvalues_safe)
     condition_number = max_eig / min_eig
     
-    adjusted_epsilon = torch.tensor(base_epsilon, device = eigenvalues.device)
-    for threshold, epsilon_val in zip(thresholds_tensor, epsilons_tensor):
-        mask = condition_number >= threshold
-        adjusted_epsilon = torch.where(mask, epsilon_val, adjusted_epsilon)
-    
+    compare_result = condition_number >= thresholds_tensor
+    if compare_result.any():
+        indices = torch.arange(len(thresholds_tensor), device = thresholds_tensor.device)
+        valid_indices = torch.where(compare_result, indices, -1)
+        max_valid_idx = valid_indices.max()
+        adjusted_epsilon = epsilons_tensor[max_valid_idx]
+    else:
+        adjusted_epsilon = torch.tensor(base_epsilon, device= eigenvalues.device)
+
     return adjusted_epsilon
 
 def matrix_inverse_root(
@@ -118,6 +127,7 @@ def matrix_inverse_root(
     condition_thresholds : Optional[Dict[float, float]] = None,
     thresholds_tensor: Optional[Tensor] = None,
     epsilons_tensor : Optional[Tensor] = None,
+    small_positive_tensor: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Union[float, Tensor]]:
     """Computes matrix root inverse of square symmetric positive definite matrix.
 
@@ -176,6 +186,7 @@ def matrix_inverse_root(
             condition_thresholds = condition_thresholds,
             thresholds_tensor = thresholds_tensor,
             epsilons_tensor = epsilons_tensor,
+            small_positive_tensor = small_positive_tensor,
         )
     elif root_inv_method == RootInvMethod.NEWTON:
         # Newton method는 adaptive epsilon 미지원.
@@ -257,6 +268,7 @@ def _matrix_root_eigen(
     condition_thresholds: Optional[Dict[float, float]] = None,
     thresholds_tensor: Optional[Tensor] = None,
     epsilons_tensor: Optional[Tensor] = None,
+    small_positive_tensor = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: 
     """
     Returns:
@@ -295,7 +307,7 @@ def _matrix_root_eigen(
     if make_positive_semidefinite:
         L += -torch.minimum(lambda_min, torch.as_tensor(0.0, device=L.device))
 
-    # ✅ Condition number 계산 (GPU에서)
+    #  Condition number 계산 (GPU에서)
     condition_number_tensor = torch.tensor(float('inf'), device=L.device)
     if L.numel() > 1:
         L_safe = torch.where(L > 0, L, torch.tensor(1e-9, device=L.device))
@@ -303,12 +315,12 @@ def _matrix_root_eigen(
         min_eig = torch.min(L_safe)
         condition_number_tensor = max_eig / min_eig  # GPU Tensor
 
-    # ✅ Adaptive epsilon (GPU only)
+    #  Adaptive epsilon (GPU only)
     if use_adaptive_epsilon and torch.numel(L) > 1:
         if thresholds_tensor is not None and epsilons_tensor is not None:
             # GPU Tensor 사용 (동기화 없음)
             used_epsilon_tensor = compute_condition_based_epsilon_gpu(
-                L, epsilon, thresholds_tensor, epsilons_tensor
+                L, epsilon, thresholds_tensor, epsilons_tensor, small_positive_tensor
             )
         else:
             # Fallback

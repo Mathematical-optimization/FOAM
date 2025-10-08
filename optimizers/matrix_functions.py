@@ -39,7 +39,6 @@ def check_diagonal(A: Tensor) -> bool:
 
     # Check both upper triangular part and lower triangular part are all zeros.
     return not A.triu(diagonal=1).any() and not A.tril(diagonal=-1).any()
-
 def compute_condition_based_epsilon(
         eigenvalues : Tensor,
         base_epsilon : float,
@@ -74,6 +73,37 @@ def compute_condition_based_epsilon(
             break
     return adjusted_epsilon, condition_number.item()
 
+
+def compute_condition_based_epsilon_gpu(
+        eigenvalues : Tensor,
+        base_epsilon : float,
+        thresholds_tensor : Tensor,
+        epsilons_tensor : Tensor,
+) -> Tensor:
+    """
+    조건수에 기반하여 epsilon을 적응적으로 조정함.
+
+    condition_thresholds : 조건수 임계값과 epsilon 매핑 
+    기본값 : {1e6 : 1e-05, 1e8 : 5e-5}
+
+    조정된 epsilon 값 반환.
+    """
+    eigenvalues_safe = torch.where(
+        eigenvalues >0,
+        eigenvalues,
+        torch.full_like(eigenvalues, 1e-9)
+    )
+    max_eig = torch.max(eigenvalues_safe)
+    min_eig = torch.min(eigenvalues_safe)
+    condition_number = max_eig / min_eig
+    
+    adjusted_epsilon = torch.tensor(base_epsilon, device = eigenvalues.device)
+    for threshold, epsilon_val in zip(thresholds_tensor, epsilons_tensor):
+        mask = condition_number >= threshold
+        adjusted_epsilon = torch.where(mask, epsilon_val, adjusted_epsilon)
+    
+    return adjusted_epsilon
+
 def matrix_inverse_root(
     A: Tensor,
     root: int,
@@ -86,7 +116,9 @@ def matrix_inverse_root(
     retry_double_precision: bool = True,
     use_adaptive_epsilon: bool = False,
     condition_thresholds : Optional[Dict[float, float]] = None,
-) -> Tuple[Tensor, float]:
+    thresholds_tensor: Optional[Tensor] = None,
+    epsilons_tensor : Optional[Tensor] = None,
+) -> Tuple[Tensor, Union[float, Tensor]]:
     """Computes matrix root inverse of square symmetric positive definite matrix.
 
     Args:
@@ -142,6 +174,8 @@ def matrix_inverse_root(
             retry_double_precision=retry_double_precision,
             use_adaptive_epsilon = use_adaptive_epsilon,
             condition_thresholds = condition_thresholds,
+            thresholds_tensor = thresholds_tensor,
+            epsilons_tensor = epsilons_tensor,
         )
     elif root_inv_method == RootInvMethod.NEWTON:
         # Newton method는 adaptive epsilon 미지원.
@@ -219,49 +253,37 @@ def _matrix_root_eigen(
     exponent_multiplier: float = 1.0,
     make_positive_semidefinite: bool = True,
     retry_double_precision: bool = True,
-    use_adaptive_epsilon : bool = False,
+    use_adaptive_epsilon: bool = False,
     condition_thresholds: Optional[Dict[float, float]] = None,
-) -> Tuple[Tensor, Tensor, Tensor, float, float]:
-    """Compute matrix (inverse) root using eigendecomposition of symmetric positive (semi-)definite matrix.
-
-            A = Q L Q^T => A^{1/r} = Q L^{1/r} Q^T OR A^{-1/r} = Q L^{-1/r} Q^T
-
-    Assumes matrix A is symmetric.
-
-    Args:
-        A (Tensor): Square matrix of interest.
-        root (int): Root of interest. Any natural number.
-        epsilon (float): Adds epsilon * I to matrix before taking matrix root. (Default: 0.0)
-        inverse (bool): Returns inverse root matrix. (Default: True)
-        exponent_multiplier (float): exponent multiplier in the eigen method (Default: 1.0)
-        make_positive_semidefinite (bool): Perturbs matrix eigenvalues to ensure it is numerically positive semi-definite. (Default: True)
-        retry_double_precision (bool): Flag for re-trying eigendecomposition with higher precision if lower precision fails due
-            to CuSOLVER failure. (Default: True)
-
+    thresholds_tensor: Optional[Tensor] = None,
+    epsilons_tensor: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: 
+    """
     Returns:
-        X (Tensor): (Inverse) root of matrix. Same dimensions as A.
-        L (Tensor): Eigenvalues of A.
-        Q (Tensor): Orthogonal matrix consisting of eigenvectors of A.
-
+        X: (Inverse) root of matrix
+        L: Eigenvalues
+        Q: Eigenvectors
+        used_epsilon: 실제 사용된 epsilon (Tensor)
+        condition_number: 조건수 (Tensor) 
     """
 
-    # check if root is positive integer
+    # Check if root is positive integer
     if root <= 0:
         raise ValueError(f"Root {root} should be positive!")
 
-    # compute matrix power
+    # Compute matrix power
     alpha = exponent_multiplier / root
     if inverse:
         alpha = -alpha
 
-    # compute eigendecomposition and compute minimum eigenvalue
+    # Compute eigendecomposition
     try:
         L, Q = torch.linalg.eigh(A)
-
     except Exception as exception:
         if retry_double_precision and A.dtype != torch.float64:
             logger.warning(
-                f"Failed to compute eigendecomposition in {A.dtype} precision with exception {exception}! Retrying in double precision..."
+                f"Failed to compute eigendecomposition in {A.dtype} precision with exception {exception}! "
+                f"Retrying in double precision..."
             )
             L, Q = torch.linalg.eigh(A.double())
         else:
@@ -269,28 +291,42 @@ def _matrix_root_eigen(
 
     lambda_min = torch.min(L)
 
-    # make eigenvalues >= 0 (if necessary)
+    # Make eigenvalues >= 0 (if necessary)
     if make_positive_semidefinite:
-        L += -torch.minimum(lambda_min, torch.as_tensor(0.0))
+        L += -torch.minimum(lambda_min, torch.as_tensor(0.0, device=L.device))
 
-    used_epsilon = epsilon
-    condition_number = float('inf')
+    # ✅ Condition number 계산 (GPU에서)
+    condition_number_tensor = torch.tensor(float('inf'), device=L.device)
+    if L.numel() > 1:
+        L_safe = torch.where(L > 0, L, torch.tensor(1e-9, device=L.device))
+        max_eig = torch.max(L_safe)
+        min_eig = torch.min(L_safe)
+        condition_number_tensor = max_eig / min_eig  # GPU Tensor
 
+    # ✅ Adaptive epsilon (GPU only)
     if use_adaptive_epsilon and torch.numel(L) > 1:
-        adjusted_epsilon, condition_number = compute_condition_based_epsilon(
-            L, epsilon, condition_thresholds
-        )
-        if adjusted_epsilon != epsilon:
-            logger.debug(f'Adjusted epsilon from {epsilon:.2e} to {adjusted_epsilon:.2e}'
-                         f"due to condition number {condition_number:.2e}")
-            used_epsilon = adjusted_epsilon
-    # add epsilon
-    L += used_epsilon
+        if thresholds_tensor is not None and epsilons_tensor is not None:
+            # GPU Tensor 사용 (동기화 없음)
+            used_epsilon_tensor = compute_condition_based_epsilon_gpu(
+                L, epsilon, thresholds_tensor, epsilons_tensor
+            )
+        else:
+            # Fallback
+            logger.warning("thresholds_tensor or epsilons_tensor is None, using legacy method")
+            adjusted_epsilon, _ = compute_condition_based_epsilon(
+                L, epsilon, condition_thresholds
+            )
+            used_epsilon_tensor = torch.tensor(adjusted_epsilon, device=L.device)
+    else:
+        used_epsilon_tensor = torch.tensor(epsilon, device=L.device)
 
-    # compute inverse preconditioner
+    # Add epsilon (GPU only)
+    L += used_epsilon_tensor
+
+    # Compute inverse preconditioner
     X = Q * L.pow(alpha).unsqueeze(0) @ Q.T
 
-    return X, L, Q, used_epsilon, condition_number
+    return X, L, Q, used_epsilon_tensor, condition_number_tensor  
 
 
 def _matrix_inverse_root_newton(

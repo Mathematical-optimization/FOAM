@@ -43,7 +43,7 @@ LABEL_SMOOTHING=0.1
 
 # Epsilon 프리셋 선택
 # 옵션: 'default', 'asymmetric', 'adaptive', 'adaptive_asymmetric', 'custom'
-EPSILON_PRESET="default"
+EPSILON_PRESET="adaptive_asymmetric"
 
 # 프리셋별 설명:
 # - default: 모든 matrix에 동일한 epsilon (1e-10) 사용, 비적응형
@@ -55,9 +55,9 @@ EPSILON_PRESET="default"
 # Custom 설정 시 사용할 값들 (EPSILON_PRESET='custom'일 때만 적용)
 EPSILON_BASE=1e-8           # 기본 epsilon (1D tensor용)
 EPSILON_LEFT=1e-8            # L matrix epsilon (비워두면 EPSILON_BASE 사용)
-EPSILON_RIGHT=5e-5           # R matrix epsilon (비워두면 EPSILON_BASE 사용)
-USE_ADAPTIVE_EPSILON=false   # true/false - 적응형 epsilon 사용 여부
-CONDITION_THRESHOLDS="1e6:1e-5,1e8:5e-5"  # 조건수:epsilon 매핑
+EPSILON_RIGHT=1e-4           # R matrix epsilon (비워두면 EPSILON_BASE 사용)
+USE_ADAPTIVE_EPSILON=true   # true/false - 적응형 epsilon 사용 여부
+CONDITION_THRESHOLDS="1e7:1e-3"  # 조건수:epsilon 매핑
 
 # 체크포인트에서 재개 (필요시 설정, 빈 값이면 새로 시작)
 RESUME_FROM=""

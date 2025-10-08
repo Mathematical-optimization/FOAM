@@ -351,11 +351,11 @@ def get_epsilon_config(args):
             'condition_thresholds': {1e6: 1e-5, 1e8: 5e-5}
         },
         'adaptive_asymmetric': {
-            'epsilon': 1e-08,
+            'epsilon': 1e-8,
             'epsilon_left': 1e-8,
-            'epsilon_right': 5e-5,
+            'epsilon_right': 1e-4,
             'use_adaptive_epsilon': True,
-            'condition_thresholds': {1e6: 1e-5, 1e8: 5e-5}
+            'condition_thresholds': {5e6: 5e-3, 1e6: 1e-3}
         }
     }
     

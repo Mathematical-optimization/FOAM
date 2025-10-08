@@ -339,7 +339,7 @@ def get_epsilon_config(args):
         'asymmetric': {
             'epsilon': 1e-08,
             'epsilon_left': 1e-8,
-            'epsilon_right': 5e-5,
+            'epsilon_right': 8e-5,
             'use_adaptive_epsilon': False,
             'condition_thresholds': None
         },
@@ -695,7 +695,7 @@ if __name__ == '__main__':
     parser.add_argument('--save-dir', type=str, default='checkpoints', help='Directory for saving checkpoints')
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
     
-    parser.add_argument('--epsilon-preset', type = str, default = 'default', choices = ['default', 'asymmetric', 'adpative', 'adaptive_asymmetric' ], help = 'Epsilon configuration preset')
+    parser.add_argument('--epsilon-preset', type = str, default = 'default', choices = ['default', 'asymmetric', 'adaptive', 'adaptive_asymmetric' ], help = 'Epsilon configuration preset')
     parser.add_argument('--epsilon', type= float, default = 1e-08)
     parser.add_argument('--epsilon-left', type = float, default = None)
     parser.add_argument('--epsilon-right', type = float, default = None)

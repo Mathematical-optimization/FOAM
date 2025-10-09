@@ -40,63 +40,34 @@ def check_diagonal(A: Tensor) -> bool:
     # Check both upper triangular part and lower triangular part are all zeros.
     return not A.triu(diagonal=1).any() and not A.tril(diagonal=-1).any()
 
-def compute_condition_based_epsilon(
-        eigenvalues : Tensor,
-        base_epsilon : float,
-        condition_thresholds : Optional[Dict[float, float,]] = None
-) -> float:
-    """
-    조건수에 기반하여 epsilon을 적응적으로 조정함.
-
-    condition_thresholds : 조건수 임계값과 epsilon 매핑 
-    기본값 : {1e6 : 1e-05, 1e8 : 5e-5}
-
-    조정된 epsilon 값 반환.
-    """
-    if condition_thresholds is None:
-        condition_thresholds = {
-            1e6 : 1e-5,
-            1e8: 5e-5,
-        }
-    max_eigenvalue = torch.max(eigenvalues)
-    min_eigenvalue = torch.min(eigenvalues)
-
-    if min_eigenvalue <= 0:
-        min_eigenvalue = torch.min(eigenvalues[eigenvalues > 0]) if torch.any(eigenvalues > 0) else 1e-09
-
-    condition_number = max_eigenvalue/min_eigenvalue
-
-    adjusted_epsilon = base_epsilon
-    for threshold, epsilon_value in sorted(condition_thresholds.items()):
-        if condition_number >= threshold:
-            adjusted_epsilon = epsilon_value
-        else:
-            break
-    return adjusted_epsilon, condition_number.item()
-
 
 def compute_condition_based_epsilon_gpu(
-        eigenvalues : Tensor,
-        base_epsilon : float,
-        thresholds_tensor : Tensor,
-        epsilons_tensor : Tensor,
-        small_positive_tensor : Optional[Tensor] = None,
+    eigenvalues: Tensor,
+    base_epsilon: float,
+    thresholds_tensor: Tensor,
+    epsilons_tensor: Tensor,
+    small_positive_tensor: Optional[Tensor] = None,
 ) -> Tensor:
     """
-    조건수에 기반하여 epsilon을 적응적으로 조정함.
-
-    condition_thresholds : 조건수 임계값과 epsilon 매핑 
-    기본값 : {1e6 : 1e-05, 1e8 : 5e-5}
-
-    조정된 epsilon 값 반환.
+    GPU-optimized adaptive epsilon computation based on condition number.
+    
+    Args:
+        eigenvalues: Eigenvalues of the matrix
+        base_epsilon: Base epsilon value
+        thresholds_tensor: Sorted condition number thresholds (GPU tensor)
+        epsilons_tensor: Corresponding epsilon values (GPU tensor)
+        small_positive_tensor: Small positive value for numerical stability
+        
+    Returns:
+        Adjusted epsilon value as a tensor
     """
     if small_positive_tensor is None:
-        small_positive_tensor = torch.tensor(1e-8, device = eigenvalues.device)
+        small_positive_tensor = torch.tensor(1e-8, device=eigenvalues.device)
 
     eigenvalues_safe = torch.maximum(eigenvalues, small_positive_tensor)
     max_eig = eigenvalues_safe.max()
     min_eig = eigenvalues_safe.min()
-    condition_number = max_eig/min_eig
+    condition_number = max_eig / min_eig
     
     mask = condition_number >= thresholds_tensor
     if mask.any():
@@ -105,7 +76,8 @@ def compute_condition_based_epsilon_gpu(
             idx = indices[-1]
             return epsilons_tensor[idx]
     
-    return torch.tensor(base_epsilon, device = eigenvalues.device, dtype = torch.float32)
+    return torch.tensor(base_epsilon, device=eigenvalues.device, dtype=torch.float32)
+
 
 def matrix_inverse_root(
     A: Tensor,
@@ -118,9 +90,9 @@ def matrix_inverse_root(
     is_diagonal: Union[Tensor, bool] = False,
     retry_double_precision: bool = True,
     use_adaptive_epsilon: bool = False,
-    condition_thresholds : Optional[Dict[float, float]] = None,
+    condition_thresholds: Optional[Dict[float, float]] = None,
     thresholds_tensor: Optional[Tensor] = None,
-    epsilons_tensor : Optional[Tensor] = None,
+    epsilons_tensor: Optional[Tensor] = None,
     small_positive_tensor: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Union[float, Tensor]]:
     """Computes matrix root inverse of square symmetric positive definite matrix.
@@ -137,12 +109,15 @@ def matrix_inverse_root(
             root inverse of diagonal entries. (Default: False)
         retry_double_precision (bool): Flag for re-trying eigendecomposition with higher precision if lower precision fails due
             to CuSOLVER failure. (Default: True)
-        use_adaptive_epsilon : 조건수 기반 epsilon 조정 사용 여부
-        condition_thresholds : 조건수 임계값과 epsilon 매핑
+        use_adaptive_epsilon (bool): Use adaptive epsilon based on condition number. (Default: False)
+        condition_thresholds (Dict[float, float]): Condition number thresholds mapping. (Default: None)
+        thresholds_tensor (Tensor): Pre-computed GPU tensor of thresholds. (Default: None)
+        epsilons_tensor (Tensor): Pre-computed GPU tensor of epsilon values. (Default: None)
+        small_positive_tensor (Tensor): Small positive value for numerical stability. (Default: None)
 
     Returns:
         X (Tensor): Inverse root of matrix A.
-        used_epsilon : 실제 사용된 epsilon 값.
+        used_epsilon (Union[float, Tensor]): Actually used epsilon value.
 
     """
 
@@ -176,14 +151,14 @@ def matrix_inverse_root(
             inverse=True,
             exponent_multiplier=exponent_multiplier,
             retry_double_precision=retry_double_precision,
-            use_adaptive_epsilon = use_adaptive_epsilon,
-            condition_thresholds = condition_thresholds,
-            thresholds_tensor = thresholds_tensor,
-            epsilons_tensor = epsilons_tensor,
-            small_positive_tensor = small_positive_tensor,
+            use_adaptive_epsilon=use_adaptive_epsilon,
+            condition_thresholds=condition_thresholds,
+            thresholds_tensor=thresholds_tensor,
+            epsilons_tensor=epsilons_tensor,
+            small_positive_tensor=small_positive_tensor,
         )
     elif root_inv_method == RootInvMethod.NEWTON:
-        # Newton method는 adaptive epsilon 미지원.
+        # Newton method does not support adaptive epsilon
         if exponent_multiplier != 1.0:
             raise ValueError(
                 f"Exponent multiplier {exponent_multiplier} must be equal to 1 to use coupled inverse Newton iteration!"
@@ -262,15 +237,14 @@ def _matrix_root_eigen_optimized(
     condition_thresholds: Optional[Dict[float, float]] = None,
     thresholds_tensor: Optional[Tensor] = None,
     epsilons_tensor: Optional[Tensor] = None,
-    small_positive_tensor = None,
+    small_positive_tensor: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Union[float, Tensor]]: 
     """
+    Optimized eigendecomposition-based matrix root computation with adaptive epsilon.
+    
     Returns:
         X: (Inverse) root of matrix
-        L: Eigenvalues
-        Q: Eigenvectors
-        used_epsilon: 실제 사용된 epsilon (Tensor)
-        condition_number: 조건수 (Tensor) 
+        used_epsilon: Actually used epsilon (Tensor or float)
     """
 
     # Check if root is positive integer
@@ -302,7 +276,7 @@ def _matrix_root_eigen_optimized(
         L += -torch.minimum(lambda_min, torch.as_tensor(0.0, device=L.device))
 
     # Determine epsilon to use
-    used_epsilon_tensor = torch.tensor(epsilon, device=L.device)
+    used_epsilon_tensor = torch.tensor(epsilon, device=L.device, dtype=torch.float32)
     
     # Only compute adaptive epsilon if explicitly enabled
     if use_adaptive_epsilon and torch.numel(L) > 1:
@@ -312,19 +286,20 @@ def _matrix_root_eigen_optimized(
                 L, epsilon, thresholds_tensor, epsilons_tensor, small_positive_tensor
             )
         else:
-            # Fallback to CPU computation if tensors not provided
+            # Fallback: use base epsilon if tensors not provided
             logger.warning(
                 "Adaptive epsilon enabled but GPU tensors not provided. "
                 "Using base epsilon."
             )
 
-    # Add epsilon (GPU only)
+    # Add epsilon
     L += used_epsilon_tensor
 
     # Compute inverse preconditioner
     X = Q * L.pow(alpha).unsqueeze(0) @ Q.T
 
     return X, used_epsilon_tensor
+
 
 def _matrix_inverse_root_newton(
     A: Tensor,
@@ -434,7 +409,7 @@ def compute_matrix_root_inverse_residuals(
 
     # compute error by comparing against double precision
     X, _ = matrix_inverse_root(
-        A.double(), root, epsilon=epsilon, exponent_multiplier=exponent_multiplier, use_adaptive_epsilon = False
+        A.double(), root, epsilon=epsilon, exponent_multiplier=exponent_multiplier, use_adaptive_epsilon=False
     )
     relative_error = torch.dist(X, X_hat, p=torch.inf) / torch.norm(X, p=torch.inf)
 
@@ -449,7 +424,7 @@ def compute_matrix_root_inverse_residuals(
             inverse=True,
             make_positive_semidefinite=True,
             exponent_multiplier=root / exponent_multiplier,
-            use_adaptive_epsilon = False
+            use_adaptive_epsilon=False
         )
 
     A_reg = A.double() + epsilon * torch.eye(

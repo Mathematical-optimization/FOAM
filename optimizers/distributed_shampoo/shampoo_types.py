@@ -22,8 +22,8 @@ STEP = "step"
 # Keys for parameter groups (checkpointed if specified)
 BETAS = "betas"
 EPSILON = "epsilon"
-EPSILON_LEFT = "epsilon_left"
-EPSILON_RIGHT = "epsilon_right"
+EPSILON_LEFT = "epsilon_left"          # NEW
+EPSILON_RIGHT = "epsilon_right"        # NEW
 EXPONENT_MULTIPLIER = "exponent_multiplier"
 GRAFTING_CONFIG = "grafting_config"
 INV_ROOT_OVERRIDE = "inv_root_override"

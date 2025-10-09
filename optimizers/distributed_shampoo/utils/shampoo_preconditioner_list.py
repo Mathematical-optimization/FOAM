@@ -500,7 +500,7 @@ class ShampooPreconditionerList(PreconditionerList):
         epsilon: float = 1e-10,
         epsilon_left : Optional[float] = None,
         epsilon_right : Optional[float] = None,
-        use_adaptive_epsilon:bool=False,
+        use_adaptive_epsilon: bool = False,
         condition_thresholds: Optional[Dict[float, float]] = None,
         inv_root_override: Union[int, Tuple[int, ...]] = 0,
         exponent_multiplier: float = 1.0,
@@ -516,19 +516,21 @@ class ShampooPreconditionerList(PreconditionerList):
         self._epsilon_left = epsilon_left if epsilon_left is not None else epsilon
         self._epsilon_right = epsilon_right if epsilon_right is not None else epsilon
         self._use_adaptive_epsilon = use_adaptive_epsilon
-        self._condition_thresholds = condition_thresholds or {
-            {1e6: 1e-5, 1e8:1e-4} if use_adaptive_epsilon else None
-        }
+        self._condition_thresholds = condition_thresholds or (
+            {1e6: 1e-5, 1e8: 1e-4} if use_adaptive_epsilon else None
+        )
+        
+        # Adaptive epsilon GPU tensors (lazy initialization)
         self._thresholds_tensor = None
         self._epsilons_tensor = None
-        self._thresholds_keys = []
-        self._thresholds_values =[]
         self._small_positive_tensor = None
-        self._base_epsilon_tensor = None
-        if self._use_adaptive_epsilon:
-            self._thresholds_keys = sorted(self._condition_thresholds.keys())
-            self._thresholds_values = [self._condition_thresholds[k] for k in self._thresholds_keys]
-        self._condition_numbers: Dict[str, List[float]] = {}
+        
+        # Determine if we need per-dimension epsilon
+        self._use_per_dim_epsilon = (
+            use_adaptive_epsilon or 
+            self._epsilon_left != self._epsilon_right
+        )
+        
         self._inv_root_override = inv_root_override
         self._exponent_multiplier = exponent_multiplier
         self._factor_matrix_dtype = factor_matrix_dtype
@@ -542,7 +544,8 @@ class ShampooPreconditionerList(PreconditionerList):
         # This is because the optimizer state is defined per-parameter, but ShampooPreconditionerList is defined
         # across each parameter group (which includes multiple parameters).
         kronecker_factors_list = []
-        epsilon_per_dim_list = []
+        epsilon_per_dim_list = [] if self._use_per_dim_epsilon else None
+        
         for block, block_info, dims in zip(
             block_list, block_info_list, self._dims_list, 
         ):
@@ -551,21 +554,17 @@ class ShampooPreconditionerList(PreconditionerList):
                 state[block_info.param][block_index] = {}
             block_state = state[block_info.param][block_index]
 
-            block_epsilon_per_dim = []
-            for dim_idx, dim in enumerate(dims):
-                if len(dims) == 1:
-                    block_epsilon_per_dim.append(self._epsilon)
-                elif len(dims) == 2:
-                    if dim_idx == 0:
+            # Only compute per-dim epsilon if needed
+            if self._use_per_dim_epsilon:
+                block_epsilon_per_dim = []
+                for dim_idx, dim in enumerate(dims):
+                    if len(dims) == 1:
+                        block_epsilon_per_dim.append(self._epsilon)
+                    elif dim_idx == 0:
                         block_epsilon_per_dim.append(self._epsilon_left)
                     else:
                         block_epsilon_per_dim.append(self._epsilon_right)
-                else:
-                    if dim_idx == 0:
-                        block_epsilon_per_dim.append(self._epsilon_left)
-                    else:
-                        block_epsilon_per_dim.append(self._epsilon_right)
-            epsilon_per_dim_list.append(tuple(block_epsilon_per_dim))
+                epsilon_per_dim_list.append(tuple(block_epsilon_per_dim))
 
             # Instantiate ShampooKroneckerFactors for this block.
             # The factor matrices are instantiated using the determined dtype.
@@ -608,21 +607,36 @@ class ShampooPreconditionerList(PreconditionerList):
                 )
             )
 
-            logger.info(
-                f"Instantiated Shampoo Preconditioner {preconditioner_index} "
-                f"({[factor_matrix.shape for factor_matrix in block_state[SHAMPOO].factor_matrices]}) "
-                f"with epsilon per dim: {block_epsilon_per_dim} "
-                f"for Parameter {param_index} ({block_info.param.shape}), Block {block_index} ({block.shape})."
-            )
+            # Enhanced logging
+            if self._use_per_dim_epsilon and epsilon_per_dim_list:
+                logger.info(
+                    f"Instantiated Shampoo Preconditioner {preconditioner_index} "
+                    f"({[factor_matrix.shape for factor_matrix in block_state[SHAMPOO].factor_matrices]}) "
+                    f"with epsilon per dim: {epsilon_per_dim_list[-1]} "
+                    f"for Parameter {param_index} ({block_info.param.shape}), Block {block_index} ({block.shape})."
+                )
+            else:
+                logger.info(
+                    f"Instantiated Shampoo Preconditioner {preconditioner_index} "
+                    f"({[factor_matrix.shape for factor_matrix in block_state[SHAMPOO].factor_matrices]}) "
+                    f"with epsilon: {self._epsilon} "
+                    f"for Parameter {param_index} ({block_info.param.shape}), Block {block_index} ({block.shape})."
+                )
 
         # Initialize local lists.
         local_block_list = compress_list(block_list, distributor_selector)
         self._local_kronecker_factors_list: Tuple[
             ShampooKroneckerFactors, ...
         ] = compress_list(kronecker_factors_list, distributor_selector)
-        self._local_epsilon_per_dim_list : Tuple[Tuple[float, ...], ...] = compress_list(
-            epsilon_per_dim_list, distributor_selector
-        )
+        
+        # Only create epsilon list if needed
+        if self._use_per_dim_epsilon:
+            self._local_epsilon_per_dim_list: Tuple[Tuple[float, ...], ...] = compress_list(
+                epsilon_per_dim_list, distributor_selector
+            )
+        else:
+            self._local_epsilon_per_dim_list = None
+            
         self._local_order_list: Tuple[int, ...] = tuple(
             block.dim() for block in local_block_list
         )
@@ -636,7 +650,9 @@ class ShampooPreconditionerList(PreconditionerList):
         self._masked_kronecker_factors_list: Tuple[
             ShampooKroneckerFactors, ...
         ] = self._local_kronecker_factors_list
-        self._masked_epsilon_per_dim_list : Tuple[Tuple[float, ...], ...] = self._local_epsilon_per_dim_list
+        self._masked_epsilon_per_dim_list: Tuple[Tuple[float, ...], ...] = (
+            self._local_epsilon_per_dim_list if self._use_per_dim_epsilon else None
+        )
         
         # Construct lists of bytes and numels for logging purposes.
         # NOTE: These lists are constructed across all blocked parameters.
@@ -666,7 +682,7 @@ class ShampooPreconditionerList(PreconditionerList):
 
     def _initialize_adaptive_epsilon_tensors(self) -> None:
         """Initialize GPU tensors for adaptive epsilon computation once."""
-        if not self._condition_thresholds:
+        if not self._condition_thresholds or self._thresholds_tensor is not None:
             return
             
         device = self._local_kronecker_factors_list[0].factor_matrices[0].device
@@ -790,6 +806,109 @@ class ShampooPreconditionerList(PreconditionerList):
                 )
             )
 
+    def _compute_single_root_inverse(
+        self,
+        factor_matrix: Tensor,
+        inv_factor_matrix: Tensor,
+        is_factor_matrix_diagonal: Tensor,
+        factor_matrix_index: str,
+        root: int,
+        epsilon_value: float,
+    ) -> None:
+        """Compute root inverse for a single factor matrix."""
+        # For tracking diagonality of the preconditioner.
+        # Checks if the preconditioner is currently diagonal, then checks whether or not
+        # the update matrix is diagonal.
+        if is_factor_matrix_diagonal and not check_diagonal(factor_matrix):
+            is_factor_matrix_diagonal.copy_(torch.tensor(False))
+            logger.debug(
+                f"Factor matrix {factor_matrix_index} is not diagonal."
+            )
+
+        # Add epsilon term and incorporate bias correction.
+        bias_corrected_factor_matrix = (
+            factor_matrix / self._bias_correction2
+        )
+
+        # Check for nan or inf values.
+        if torch.isnan(bias_corrected_factor_matrix).any():
+            raise ValueError(
+                f"Encountered nan values in bias-corrected factor matrix {factor_matrix_index}! "
+                f"To mitigate, check if nan inputs are being passed into the network or nan gradients "
+                f"are being passed to the optimizer."
+                f"For debugging purposes, factor_matrix {factor_matrix_index}: "
+                f"{torch.min(factor_matrix)=}, {torch.max(factor_matrix)=}, "
+                f"{factor_matrix.isinf().any()=}, {factor_matrix.isnan().any()=}."
+            )
+        if torch.isinf(bias_corrected_factor_matrix).any():
+            raise ValueError(
+                f"Encountered inf values in bias-corrected factor matrix {factor_matrix_index}! "
+                f"In some cases, this may be due to divergence of the algorithm. "
+                f"To mitigate, try decreasing the learning rate or increasing grafting epsilon."
+                f"For debugging purposes, factor_matrix {factor_matrix_index}: "
+                f"{torch.min(factor_matrix)=}, {torch.max(factor_matrix)=}, "
+                f"{factor_matrix.isinf().any()=}, {factor_matrix.isnan().any()=}."
+            )
+
+        # Compute inverse preconditioner.
+        # If reuse_previous_inv_factor_matrix is True, will reuse previous matrix if matrix
+        # inverse root computation fails.
+        try:
+            result = matrix_inverse_root(
+                A=bias_corrected_factor_matrix,
+                root=root,
+                epsilon=epsilon_value,
+                use_adaptive_epsilon=self._use_adaptive_epsilon,
+                condition_thresholds=self._condition_thresholds if self._use_adaptive_epsilon else None,
+                thresholds_tensor=self._thresholds_tensor if self._use_adaptive_epsilon else None,
+                epsilons_tensor=self._epsilons_tensor if self._use_adaptive_epsilon else None,
+                small_positive_tensor=self._small_positive_tensor if self._use_adaptive_epsilon else None,
+                exponent_multiplier=self._exponent_multiplier,
+                is_diagonal=is_factor_matrix_diagonal,
+                retry_double_precision=self._use_protected_eigh,
+            )
+            
+            computed_inv_factor_matrix, used_epsilon_tensor = result
+            computed_inv_factor_matrix = computed_inv_factor_matrix.to(
+                dtype=inv_factor_matrix.dtype
+            )
+
+            if self._use_adaptive_epsilon and logger.isEnabledFor(logging.DEBUG):
+                if isinstance(used_epsilon_tensor, torch.Tensor):
+                    if abs(float(used_epsilon_tensor) - epsilon_value) > 1e-12:
+                        logger.debug(
+                            f"Factor matrix {factor_matrix_index}: "
+                            f"Original epsilon = {epsilon_value:.2e}, "
+                            f"Adjusted epsilon = {float(used_epsilon_tensor):.2e}"
+                        )
+            
+            # Check if we encounter NaN or inf values in computed inverse matrix.
+            if (
+                torch.isnan(computed_inv_factor_matrix).any()
+                or torch.isinf(computed_inv_factor_matrix).any()
+            ):
+                torch.set_printoptions(threshold=100_000)
+                raise ValueError(
+                    f"Encountered nan or inf values in inverse factor matrix {factor_matrix_index}! "
+                    f"To mitigate, check factor matrix before matrix inverse root computation: "
+                    f"{bias_corrected_factor_matrix=}"
+                )
+
+            inv_factor_matrix.copy_(computed_inv_factor_matrix)
+
+        except Exception as exception:
+            if (
+                not self._use_protected_eigh
+                or "Encountered nan or inf values in inverse factor matrix"
+                in str(exception)
+            ):
+                raise exception
+            else:
+                logger.warning(
+                    f"Matrix inverse root computation failed for factor matrix {factor_matrix_index} "
+                    f"with exception {exception}. Using previous inv_factor_matrix and continuing..."
+                )
+
     def compute_root_inverse(self) -> None:
         # NOTE: This function currently only computes the matrix root inverse based on
         # the masked lists which combines both selection based on the distributor and where
@@ -799,117 +918,63 @@ class ShampooPreconditionerList(PreconditionerList):
         with profiler.record_function(
             f"## {self.__class__.__name__}:{self.compute_root_inverse.__name__} ##"
         ):
-            for kronecker_factors, root, epsilon_per_dim in zip(
-                self._local_kronecker_factors_list,
-                self._local_root_list,
-                self._local_epsilon_per_dim_list,
-            ):
-                for (
-                    factor_matrix,
-                    inv_factor_matrix,
-                    is_factor_matrix_diagonal,
-                    factor_matrix_index,
-                    epsilon_for_this_dim,
-                ) in zip(
-                    kronecker_factors.factor_matrices,
-                    kronecker_factors.inv_factor_matrices,
-                    kronecker_factors.is_factor_matrices_diagonal,
-                    kronecker_factors.factor_matrix_indices,
-                    epsilon_per_dim,
+            # Lazy initialization of adaptive epsilon tensors
+            if self._use_adaptive_epsilon and self._thresholds_tensor is None:
+                self._initialize_adaptive_epsilon_tensors()
+            
+            if self._use_per_dim_epsilon:
+                # Per-dimension epsilon path
+                for kronecker_factors, root, epsilon_per_dim in zip(
+                    self._local_kronecker_factors_list,
+                    self._local_root_list,
+                    self._local_epsilon_per_dim_list,
                 ):
-                    # For tracking diagonality of the preconditioner.
-                    # Checks if the preconditioner is currently diagonal, then checks whether or not
-                    # the update matrix is diagonal.
-                    if is_factor_matrix_diagonal and not check_diagonal(factor_matrix):
-                        is_factor_matrix_diagonal.copy_(torch.tensor(False))
-                        logger.debug(
-                            f"Factor matrix {factor_matrix_index} is not diagonal."
+                    for (
+                        factor_matrix,
+                        inv_factor_matrix,
+                        is_factor_matrix_diagonal,
+                        factor_matrix_index,
+                        epsilon_for_this_dim,
+                    ) in zip(
+                        kronecker_factors.factor_matrices,
+                        kronecker_factors.inv_factor_matrices,
+                        kronecker_factors.is_factor_matrices_diagonal,
+                        kronecker_factors.factor_matrix_indices,
+                        epsilon_per_dim,
+                    ):
+                        self._compute_single_root_inverse(
+                            factor_matrix,
+                            inv_factor_matrix,
+                            is_factor_matrix_diagonal,
+                            factor_matrix_index,
+                            root,
+                            epsilon_for_this_dim,
                         )
-
-                    # Add epsilon term and incorporate bias correction.
-                    bias_corrected_factor_matrix = (
-                        factor_matrix / self._bias_correction2
-                    )
-
-                    # Check for nan or inf values.
-                    if torch.isnan(bias_corrected_factor_matrix).any():
-                        raise ValueError(
-                            f"Encountered nan values in bias-corrected factor matrix {factor_matrix_index}! "
-                            f"To mitigate, check if nan inputs are being passed into the network or nan gradients "
-                            f"are being passed to the optimizer."
-                            f"For debugging purposes, factor_matrix {factor_matrix_index}: "
-                            f"{torch.min(factor_matrix)=}, {torch.max(factor_matrix)=}, "
-                            f"{factor_matrix.isinf().any()=}, {factor_matrix.isnan().any()=}."
+            else:
+                # Fast path: single epsilon for all dimensions
+                for kronecker_factors, root in zip(
+                    self._local_kronecker_factors_list,
+                    self._local_root_list,
+                ):
+                    for (
+                        factor_matrix,
+                        inv_factor_matrix,
+                        is_factor_matrix_diagonal,
+                        factor_matrix_index,
+                    ) in zip(
+                        kronecker_factors.factor_matrices,
+                        kronecker_factors.inv_factor_matrices,
+                        kronecker_factors.is_factor_matrices_diagonal,
+                        kronecker_factors.factor_matrix_indices,
+                    ):
+                        self._compute_single_root_inverse(
+                            factor_matrix,
+                            inv_factor_matrix,
+                            is_factor_matrix_diagonal,
+                            factor_matrix_index,
+                            root,
+                            self._epsilon,
                         )
-                    if torch.isinf(bias_corrected_factor_matrix).any():
-                        raise ValueError(
-                            f"Encountered inf values in bias-corrected factor matrix {factor_matrix_index}! "
-                            f"In some cases, this may be due to divergence of the algorithm. "
-                            f"To mitigate, try decreasing the learning rate or increasing grafting epsilon."
-                            f"For debugging purposes, factor_matrix {factor_matrix_index}: "
-                            f"{torch.min(factor_matrix)=}, {torch.max(factor_matrix)=}, "
-                            f"{factor_matrix.isinf().any()=}, {factor_matrix.isnan().any()=}."
-                        )
-
-                    # Compute inverse preconditioner.
-                    # If reuse_previous_inv_factor_matrix is True, will reuse previous matrix if matrix
-                    # inverse root computation fails.
-                    try:
-                        result = matrix_inverse_root(
-                            A=bias_corrected_factor_matrix,
-                            root=root,
-                            epsilon=epsilon_for_this_dim,
-                            use_adaptive_epsilon = self._use_adaptive_epsilon,
-                            condition_thresholds = self._condition_thresholds,
-                            thresholds_tensor = self._thresholds_tensor,
-                            epsilons_tensor = self._epsilons_tensor,
-                            small_positive_tensor=self._small_positive_tensor,
-                            exponent_multiplier=self._exponent_multiplier,
-                            is_diagonal=is_factor_matrix_diagonal,
-                            retry_double_precision=self._use_protected_eigh,
-                        )
-                        
-                        computed_inv_factor_matrix, used_epsilon_tensor = result
-                        computed_inv_factor_matrix = computed_inv_factor_matrix.to(
-                            dtype = inv_factor_matrix.dtype
-                        )
-
-                        if self._use_adaptive_epsilon and logger.isEnabledFor(logging.DEBUG):
-                            if isinstance(used_epsilon_tensor, torch.Tensor):
-                                if abs(float(used_epsilon_tensor) - epsilon_for_this_dim) > 1e-12:
-                                    logger.debug(
-                                        f"Factor matrix {factor_matrix_index}: "
-                                        f"Original epsilon = {epsilon_for_this_dim:.2e}, "
-                                        f"Adjusted epsilon = {float(used_epsilon_tensor):.2e}"
-                                    )
-                        
-                        
-                        # Check if we encounter NaN or inf values in computed inverse matrix.
-                        if (
-                            torch.isnan(computed_inv_factor_matrix).any()
-                            or torch.isinf(computed_inv_factor_matrix).any()
-                        ):
-                            torch.set_printoptions(threshold=100_000)
-                            raise ValueError(
-                                f"Encountered nan or inf values in inverse factor matrix {factor_matrix_index}! "
-                                f"To mitigate, check factor matrix before matrix inverse root computation: "
-                                f"{bias_corrected_factor_matrix=}"
-                            )
-
-                        inv_factor_matrix.copy_(computed_inv_factor_matrix)
-
-                    except Exception as exception:
-                        if (
-                            not self._use_protected_eigh
-                            or "Encountered nan or inf values in inverse factor matrix"
-                            in str(exception)
-                        ):
-                            raise exception
-                        else:
-                            logger.warning(
-                                f"Matrix inverse root computation failed for factor matrix {factor_matrix_index} "
-                                f"with exception {exception}. Using previous inv_factor_matrix and continuing..."
-                            )
 
     def compress_preconditioner_list(
         self, local_grad_selector: Tuple[bool, ...]
@@ -926,36 +991,64 @@ class ShampooPreconditionerList(PreconditionerList):
             self._masked_kronecker_factors_list: Tuple[
                 ShampooKroneckerFactors, ...
             ] = compress_list(self._local_kronecker_factors_list, local_grad_selector)
-            self._masked_epsilon_per_dim_list = compress_list(
-                self._local_epsilon_per_dim_list, local_grad_selector
-            )
+            
+            if self._use_per_dim_epsilon:
+                self._masked_epsilon_per_dim_list = compress_list(
+                    self._local_epsilon_per_dim_list, local_grad_selector
+                )
+
     def compute_root_inverse_residuals(
         self,
     ) -> Tuple[Tuple[Tensor, ...], Tuple[Tensor, ...]]:
         relative_errors = []
         relative_residuals = []
 
-        for kronecker_factors, root in zip(
-            self._masked_kronecker_factors_list,
-            self._masked_root_list,
-        ):
-            for factor_matrix, inv_factor_matrix, epsilon_for_this_dim in zip(
-                kronecker_factors.factor_matrices,
-                kronecker_factors.inv_factor_matrices,
+        if self._use_per_dim_epsilon:
+            for kronecker_factors, root, epsilon_per_dim in zip(
+                self._masked_kronecker_factors_list,
+                self._masked_root_list,
+                self._masked_epsilon_per_dim_list,
             ):
-                bias_corrected_factor_matrix = factor_matrix / self._bias_correction2
-                (
-                    relative_error,
-                    relative_residual,
-                ) = compute_matrix_root_inverse_residuals(
-                    bias_corrected_factor_matrix,
-                    inv_factor_matrix,
-                    root,
-                    epsilon_for_this_dim,
-                    self._exponent_multiplier,
-                )
-                relative_errors.append(relative_error)
-                relative_residuals.append(relative_residual)
+                for factor_matrix, inv_factor_matrix, epsilon_for_this_dim in zip(
+                    kronecker_factors.factor_matrices,
+                    kronecker_factors.inv_factor_matrices,
+                    epsilon_per_dim,
+                ):
+                    bias_corrected_factor_matrix = factor_matrix / self._bias_correction2
+                    (
+                        relative_error,
+                        relative_residual,
+                    ) = compute_matrix_root_inverse_residuals(
+                        bias_corrected_factor_matrix,
+                        inv_factor_matrix,
+                        root,
+                        epsilon_for_this_dim,
+                        self._exponent_multiplier,
+                    )
+                    relative_errors.append(relative_error)
+                    relative_residuals.append(relative_residual)
+        else:
+            for kronecker_factors, root in zip(
+                self._masked_kronecker_factors_list,
+                self._masked_root_list,
+            ):
+                for factor_matrix, inv_factor_matrix in zip(
+                    kronecker_factors.factor_matrices,
+                    kronecker_factors.inv_factor_matrices,
+                ):
+                    bias_corrected_factor_matrix = factor_matrix / self._bias_correction2
+                    (
+                        relative_error,
+                        relative_residual,
+                    ) = compute_matrix_root_inverse_residuals(
+                        bias_corrected_factor_matrix,
+                        inv_factor_matrix,
+                        root,
+                        self._epsilon,
+                        self._exponent_multiplier,
+                    )
+                    relative_errors.append(relative_error)
+                    relative_residuals.append(relative_residual)
 
         return (
             tuple(relative_errors),

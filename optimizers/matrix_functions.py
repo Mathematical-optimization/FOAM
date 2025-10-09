@@ -93,25 +93,19 @@ def compute_condition_based_epsilon_gpu(
     if small_positive_tensor is None:
         small_positive_tensor = torch.tensor(1e-8, device = eigenvalues.device)
 
-    eigenvalues_safe = torch.where(
-        eigenvalues >0,
-        eigenvalues,
-        small_positive_tensor
-    )
-    max_eig = torch.max(eigenvalues_safe)
-    min_eig = torch.min(eigenvalues_safe)
-    condition_number = max_eig / min_eig
+    eigenvalues_safe = torch.maximum(eigenvalues, small_positive_tensor)
+    max_eig = eigenvalues_safe.max()
+    min_eig = eigenvalues_safe.min()
+    condition_number = max_eig/min_eig
     
-    compare_result = condition_number >= thresholds_tensor
-    if compare_result.any():
-        indices = torch.arange(len(thresholds_tensor), device = thresholds_tensor.device)
-        valid_indices = torch.where(compare_result, indices, -1)
-        max_valid_idx = valid_indices.max()
-        adjusted_epsilon = epsilons_tensor[max_valid_idx]
-    else:
-        adjusted_epsilon = torch.tensor(base_epsilon, device= eigenvalues.device)
-
-    return adjusted_epsilon
+    mask = condition_number >= thresholds_tensor
+    if mask.any():
+        indices = torch.where(mask)[0]
+        if indices.numel() > 0:
+            idx = indices[-1]
+            return epsilons_tensor[idx]
+    
+    return torch.tensor(base_epsilon, device = eigenvalues.device, dtype = torch.float32)
 
 def matrix_inverse_root(
     A: Tensor,
@@ -175,7 +169,7 @@ def matrix_inverse_root(
             return_full_matrix=True,
         )
     elif root_inv_method == RootInvMethod.EIGEN:
-        X, _, _, used_epsilon, _ = _matrix_root_eigen(
+        X, used_epsilon = _matrix_root_eigen_optimized(
             A=A,
             root=root,
             epsilon=epsilon,
@@ -256,7 +250,7 @@ def matrix_root_diagonal(
     return torch.diag(X) if return_full_matrix else X
 
 
-def _matrix_root_eigen(
+def _matrix_root_eigen_optimized(
     A: Tensor,
     root: int,
     epsilon: float = 0.0,
@@ -269,7 +263,7 @@ def _matrix_root_eigen(
     thresholds_tensor: Optional[Tensor] = None,
     epsilons_tensor: Optional[Tensor] = None,
     small_positive_tensor = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: 
+) -> Tuple[Tensor, Union[float, Tensor]]: 
     """
     Returns:
         X: (Inverse) root of matrix
@@ -307,30 +301,22 @@ def _matrix_root_eigen(
     if make_positive_semidefinite:
         L += -torch.minimum(lambda_min, torch.as_tensor(0.0, device=L.device))
 
-    #  Condition number 계산 (GPU에서)
-    condition_number_tensor = torch.tensor(float('inf'), device=L.device)
-    if L.numel() > 1:
-        L_safe = torch.where(L > 0, L, torch.tensor(1e-9, device=L.device))
-        max_eig = torch.max(L_safe)
-        min_eig = torch.min(L_safe)
-        condition_number_tensor = max_eig / min_eig  # GPU Tensor
-
-    #  Adaptive epsilon (GPU only)
+    # Determine epsilon to use
+    used_epsilon_tensor = torch.tensor(epsilon, device=L.device)
+    
+    # Only compute adaptive epsilon if explicitly enabled
     if use_adaptive_epsilon and torch.numel(L) > 1:
         if thresholds_tensor is not None and epsilons_tensor is not None:
-            # GPU Tensor 사용 (동기화 없음)
+            # GPU-optimized adaptive epsilon computation
             used_epsilon_tensor = compute_condition_based_epsilon_gpu(
                 L, epsilon, thresholds_tensor, epsilons_tensor, small_positive_tensor
             )
         else:
-            # Fallback
-            logger.warning("thresholds_tensor or epsilons_tensor is None, using legacy method")
-            adjusted_epsilon, _ = compute_condition_based_epsilon(
-                L, epsilon, condition_thresholds
+            # Fallback to CPU computation if tensors not provided
+            logger.warning(
+                "Adaptive epsilon enabled but GPU tensors not provided. "
+                "Using base epsilon."
             )
-            used_epsilon_tensor = torch.tensor(adjusted_epsilon, device=L.device)
-    else:
-        used_epsilon_tensor = torch.tensor(epsilon, device=L.device)
 
     # Add epsilon (GPU only)
     L += used_epsilon_tensor
@@ -338,8 +324,7 @@ def _matrix_root_eigen(
     # Compute inverse preconditioner
     X = Q * L.pow(alpha).unsqueeze(0) @ Q.T
 
-    return X, L, Q, used_epsilon_tensor, condition_number_tensor  
-
+    return X, used_epsilon_tensor
 
 def _matrix_inverse_root_newton(
     A: Tensor,
@@ -448,8 +433,8 @@ def compute_matrix_root_inverse_residuals(
         raise ValueError("Matrix shapes do not match!")
 
     # compute error by comparing against double precision
-    X = matrix_inverse_root(
-        A.double(), root, epsilon=epsilon, exponent_multiplier=exponent_multiplier
+    X, _ = matrix_inverse_root(
+        A.double(), root, epsilon=epsilon, exponent_multiplier=exponent_multiplier, use_adaptive_epsilon = False
     )
     relative_error = torch.dist(X, X_hat, p=torch.inf) / torch.norm(X, p=torch.inf)
 
@@ -457,13 +442,14 @@ def compute_matrix_root_inverse_residuals(
     if exponent_multiplier == 1.0:
         X_invr = torch.linalg.matrix_power(X_hat.double(), n=-root)
     else:
-        X_invr, _, _ = _matrix_root_eigen(
+        X_invr, _ = _matrix_root_eigen_optimized(
             X_hat.double(),
             root=1,
             epsilon=0.0,
             inverse=True,
             make_positive_semidefinite=True,
             exponent_multiplier=root / exponent_multiplier,
+            use_adaptive_epsilon = False
         )
 
     A_reg = A.double() + epsilon * torch.eye(

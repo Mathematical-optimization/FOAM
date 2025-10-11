@@ -17,7 +17,7 @@ N_GPUS=4
 DATA_PATH="$HOME/.cache/huggingface/datasets"
 
 # TensorBoard 로그 및 모델 체크포인트를 저장할 기본 경로
-OUTPUT_DIR="./training_output_v7"
+OUTPUT_DIR="./training_output_1010"
 
 # Python 스크립트 파일 이름
 SCRIPT_NAME="vit.py"
@@ -29,7 +29,7 @@ WORKERS=4              # 데이터 로딩에 사용할 CPU 워커 수
 
 # 옵티마이저 및 스케줄러 하이퍼파라미터
 BASE_LR=0.0013
-WARMUP_STEPS=5635
+WARMUP_STEPS=5634
 WEIGHT_DECAY=0.0005
 BETA1=0.95
 
@@ -42,22 +42,22 @@ LABEL_SMOOTHING=0.1
 # ========================================
 
 # Epsilon 프리셋 선택
-# 옵션: 'default', 'asymmetric', 'adaptive', 'adaptive_asymmetric', 'custom'
-EPSILON_PRESET="adaptive_asymmetric"
+# 옵션: 'default', 'asymmetric'
+EPSILON_PRESET="default"
 
 # 프리셋별 설명:
 # - default: 모든 matrix에 동일한 epsilon (1e-10) 사용, 비적응형
 # - asymmetric: L과 R matrix에 서로 다른 epsilon 사용 (L:1e-8, R:5e-5), 비적응형
 # - adaptive: 조건수 기반 적응형 epsilon, L과 R 동일
-# - adaptive_asymmetric: L과 R에 서로 다른 epsilon + 조건수 기반 적응형
+# - adaptive_asymmetric: L과 R에 서로 다른 epsilon + 조건수 기반 적응형                   
 # - custom: 아래 개별 설정 사용
 
 # Custom 설정 시 사용할 값들 (EPSILON_PRESET='custom'일 때만 적용)
 EPSILON_BASE=1e-8           # 기본 epsilon (1D tensor용)
 EPSILON_LEFT=1e-8            # L matrix epsilon (비워두면 EPSILON_BASE 사용)
-EPSILON_RIGHT=1e-4           # R matrix epsilon (비워두면 EPSILON_BASE 사용)
+EPSILON_RIGHT=5e-5           # R matrix epsilon (비워두면 EPSILON_BASE 사용)
 USE_ADAPTIVE_EPSILON=true   # true/false - 적응형 epsilon 사용 여부
-CONDITION_THRESHOLDS="1e7:1e-3"  # 조건수:epsilon 매핑
+CONDITION_THRESHOLDS="5e7:5e-4"  # 조건수:epsilon 매핑
 
 # 체크포인트에서 재개 (필요시 설정, 빈 값이면 새로 시작)
 RESUME_FROM=""
@@ -158,6 +158,6 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$N_GPUS $SCRIPT_NAME \
     --label-smoothing $LABEL_SMOOTHING \
     $EPSILON_OPTIONS \
     --log-interval 200 \
-    --save-interval 5
+    --save-interval 10
 
 echo "Training finished successfully."

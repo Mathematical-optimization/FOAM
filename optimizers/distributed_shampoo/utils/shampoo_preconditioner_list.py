@@ -26,6 +26,8 @@ from ...matrix_functions import (
     check_diagonal,
     compute_matrix_root_inverse_residuals,
     matrix_inverse_root,
+    matrix_inverse_root_fast_asymmetric,
+    matrix_inverse_root_fast_default
 )
 from ...optimizer_modules import OptimizerModule
 from torch import Tensor
@@ -502,6 +504,7 @@ class ShampooPreconditionerList(PreconditionerList):
         epsilon_right : Optional[float] = None,
         use_adaptive_epsilon: bool = False,
         condition_thresholds: Optional[Dict[float, float]] = None,
+        is_default_config: bool = False,  # Optimization flag
         inv_root_override: Union[int, Tuple[int, ...]] = 0,
         exponent_multiplier: float = 1.0,
         use_bias_correction: bool = True,
@@ -520,16 +523,24 @@ class ShampooPreconditionerList(PreconditionerList):
             {1e6: 1e-5, 1e8: 1e-4} if use_adaptive_epsilon else None
         )
         
-        # Adaptive epsilon GPU tensors (lazy initialization)
+        # Optimization: Fast path detection
+        self._is_default_config = is_default_config
+        
+        # For adaptive epsilon (unchanged)
         self._thresholds_tensor = None
         self._epsilons_tensor = None
         self._small_positive_tensor = None
         
-        # Determine if we need per-dimension epsilon
-        self._use_per_dim_epsilon = (
-            use_adaptive_epsilon or 
-            self._epsilon_left != self._epsilon_right
-        )
+        # Optimized: Determine configuration type
+        self._use_per_dim_epsilon = False
+        self._is_asymmetric_non_adaptive = False
+        
+        if not is_default_config:
+            if use_adaptive_epsilon:
+                self._use_per_dim_epsilon = True
+            elif self._epsilon_left != self._epsilon_right:
+                self._use_per_dim_epsilon = True
+                self._is_asymmetric_non_adaptive = True
         
         self._inv_root_override = inv_root_override
         self._exponent_multiplier = exponent_multiplier
@@ -539,12 +550,14 @@ class ShampooPreconditionerList(PreconditionerList):
         self._bias_correction2: Tensor = torch.tensor(1.0)
         
         # Instantiate (blocked) Kronecker factors and construct list of Kronecker factors.
-        # NOTE: We need to instantiate the Kronecker factor states within the optimizer's state dictionary,
-        # and do not explicitly store them as ShampooPreconditionerList attributes here.
-        # This is because the optimizer state is defined per-parameter, but ShampooPreconditionerList is defined
-        # across each parameter group (which includes multiple parameters).
         kronecker_factors_list = []
         epsilon_per_dim_list = [] if self._use_per_dim_epsilon else None
+        
+        # Pre-compute epsilon tensors for asymmetric non-adaptive case
+        if self._is_asymmetric_non_adaptive and len(block_list) > 0:
+            device = block_list[0].device
+            self._epsilon_left_tensor = torch.tensor(self._epsilon_left, device=device, dtype=torch.float64)
+            self._epsilon_right_tensor = torch.tensor(self._epsilon_right, device=device, dtype=torch.float64)
         
         for block, block_info, dims in zip(
             block_list, block_info_list, self._dims_list, 
@@ -607,8 +620,15 @@ class ShampooPreconditionerList(PreconditionerList):
                 )
             )
 
-            # Enhanced logging
-            if self._use_per_dim_epsilon and epsilon_per_dim_list:
+            # Optimized logging
+            if self._is_default_config:
+                logger.info(
+                    f"Instantiated Shampoo Preconditioner {preconditioner_index} "
+                    f"({[factor_matrix.shape for factor_matrix in block_state[SHAMPOO].factor_matrices]}) "
+                    f"with epsilon: {self._epsilon} (default config) "
+                    f"for Parameter {param_index} ({block_info.param.shape}), Block {block_index} ({block.shape})."
+                )
+            elif self._use_per_dim_epsilon and epsilon_per_dim_list:
                 logger.info(
                     f"Instantiated Shampoo Preconditioner {preconditioner_index} "
                     f"({[factor_matrix.shape for factor_matrix in block_state[SHAMPOO].factor_matrices]}) "
@@ -922,8 +942,96 @@ class ShampooPreconditionerList(PreconditionerList):
             if self._use_adaptive_epsilon and self._thresholds_tensor is None:
                 self._initialize_adaptive_epsilon_tensors()
             
-            if self._use_per_dim_epsilon:
-                # Per-dimension epsilon path
+            # Optimized: Fast path for default configuration
+            if self._is_default_config:
+                for kronecker_factors, root in zip(
+                    self._local_kronecker_factors_list,
+                    self._local_root_list,
+                ):
+                    for (
+                        factor_matrix,
+                        inv_factor_matrix,
+                        is_factor_matrix_diagonal,
+                        factor_matrix_index,
+                    ) in zip(
+                        kronecker_factors.factor_matrices,
+                        kronecker_factors.inv_factor_matrices,
+                        kronecker_factors.is_factor_matrices_diagonal,
+                        kronecker_factors.factor_matrix_indices,
+                    ):
+                        # Direct call with single epsilon
+                        if is_factor_matrix_diagonal and not check_diagonal(factor_matrix):
+                            is_factor_matrix_diagonal.copy_(torch.tensor(False))
+                        
+                        bias_corrected_factor_matrix = factor_matrix / self._bias_correction2
+                        
+                        # Fast path for default config
+                        try:
+                            computed_inv_factor_matrix = matrix_inverse_root_fast_default(
+                                A=bias_corrected_factor_matrix,
+                                root=root,
+                                epsilon=self._epsilon,
+                                exponent_multiplier=self._exponent_multiplier,
+                                is_diagonal=is_factor_matrix_diagonal,
+                                retry_double_precision=self._use_protected_eigh,
+                            ).to(dtype=inv_factor_matrix.dtype)
+                            
+                            inv_factor_matrix.copy_(computed_inv_factor_matrix)
+                        except Exception as exception:
+                            if not self._use_protected_eigh:
+                                raise exception
+                            else:
+                                logger.warning(
+                                    f"Matrix inverse root computation failed for {factor_matrix_index}: {exception}"
+                                )
+                                
+            # Optimized: Fast path for asymmetric non-adaptive configuration            
+            elif self._is_asymmetric_non_adaptive:
+                for kronecker_factors, root, epsilon_per_dim in zip(
+                    self._local_kronecker_factors_list,
+                    self._local_root_list,
+                    self._local_epsilon_per_dim_list,
+                ):
+                    for idx, (
+                        factor_matrix,
+                        inv_factor_matrix,
+                        is_factor_matrix_diagonal,
+                        factor_matrix_index,
+                        epsilon_for_this_dim,
+                    ) in enumerate(zip(
+                        kronecker_factors.factor_matrices,
+                        kronecker_factors.inv_factor_matrices,
+                        kronecker_factors.is_factor_matrices_diagonal,
+                        kronecker_factors.factor_matrix_indices,
+                        epsilon_per_dim,
+                    )):
+                        if is_factor_matrix_diagonal and not check_diagonal(factor_matrix):
+                            is_factor_matrix_diagonal.copy_(torch.tensor(False))
+                        
+                        bias_corrected_factor_matrix = factor_matrix / self._bias_correction2
+                        
+                        # Fast path for asymmetric non-adaptive
+                        try:
+                            computed_inv_factor_matrix = matrix_inverse_root_fast_asymmetric(
+                                A=bias_corrected_factor_matrix,
+                                root=root,
+                                epsilon=epsilon_for_this_dim,
+                                exponent_multiplier=self._exponent_multiplier,
+                                is_diagonal=is_factor_matrix_diagonal,
+                                retry_double_precision=self._use_protected_eigh,
+                            ).to(dtype=inv_factor_matrix.dtype)
+                            
+                            inv_factor_matrix.copy_(computed_inv_factor_matrix)
+                        except Exception as exception:
+                            if not self._use_protected_eigh:
+                                raise exception
+                            else:
+                                logger.warning(
+                                    f"Matrix inverse root computation failed for {factor_matrix_index}: {exception}"
+                                )
+                                
+            # Original path for adaptive epsilon (unchanged)
+            elif self._use_per_dim_epsilon:
                 for kronecker_factors, root, epsilon_per_dim in zip(
                     self._local_kronecker_factors_list,
                     self._local_root_list,
@@ -949,31 +1057,6 @@ class ShampooPreconditionerList(PreconditionerList):
                             factor_matrix_index,
                             root,
                             epsilon_for_this_dim,
-                        )
-            else:
-                # Fast path: single epsilon for all dimensions
-                for kronecker_factors, root in zip(
-                    self._local_kronecker_factors_list,
-                    self._local_root_list,
-                ):
-                    for (
-                        factor_matrix,
-                        inv_factor_matrix,
-                        is_factor_matrix_diagonal,
-                        factor_matrix_index,
-                    ) in zip(
-                        kronecker_factors.factor_matrices,
-                        kronecker_factors.inv_factor_matrices,
-                        kronecker_factors.is_factor_matrices_diagonal,
-                        kronecker_factors.factor_matrix_indices,
-                    ):
-                        self._compute_single_root_inverse(
-                            factor_matrix,
-                            inv_factor_matrix,
-                            is_factor_matrix_diagonal,
-                            factor_matrix_index,
-                            root,
-                            self._epsilon,
                         )
 
     def compress_preconditioner_list(

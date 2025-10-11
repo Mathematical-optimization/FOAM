@@ -40,6 +40,146 @@ def check_diagonal(A: Tensor) -> bool:
     # Check both upper triangular part and lower triangular part are all zeros.
     return not A.triu(diagonal=1).any() and not A.tril(diagonal=-1).any()
 
+def matrix_inverse_root_fast_default(
+    A: Tensor,
+    root: int,
+    epsilon: float = 0.0,
+    exponent_multiplier: float = 1.0,
+    is_diagonal: Union[Tensor, bool] = False,
+    retry_double_precision: bool = True,
+) -> Tensor:
+    """
+    Optimized fast path for default configuration (single epsilon, no adaptive).
+    Removes unnecessary checks and branches.
+    
+    Args:
+        A (Tensor): Square matrix of interest.
+        root (int): Root of interest. Any natural number.
+        epsilon (float): Adds epsilon * I to matrix before taking matrix root. (Default: 0.0)
+        exponent_multiplier (float): exponent multiplier in the eigen method (Default: 1.0)
+        is_diagonal (Tensor, bool): Flag for whether or not matrix is diagonal.
+        retry_double_precision (bool): Flag for re-trying eigendecomposition with higher precision.
+
+    Returns:
+        X (Tensor): Inverse root of matrix A.
+    """
+    
+    # check if matrix is scalar
+    if torch.numel(A) == 1:
+        alpha = torch.as_tensor(-exponent_multiplier / root)
+        return (A + epsilon) ** alpha
+
+    # check matrix shape
+    if len(A.shape) != 2:
+        raise ValueError("Matrix is not 2-dimensional!")
+    elif A.shape[0] != A.shape[1]:
+        raise ValueError("Matrix is not square!")
+
+    if is_diagonal:
+        return matrix_root_diagonal(
+            A=A,
+            root=root,
+            epsilon=epsilon,
+            inverse=True,
+            exponent_multiplier=exponent_multiplier,
+            return_full_matrix=True,
+        )
+    
+    # Fast eigendecomposition path
+    alpha = -exponent_multiplier / root
+    
+    try:
+        L, Q = torch.linalg.eigh(A)
+    except Exception as exception:
+        if retry_double_precision and A.dtype != torch.float64:
+            logger.warning(
+                f"Failed to compute eigendecomposition in {A.dtype} precision with exception {exception}! "
+                f"Retrying in double precision..."
+            )
+            L, Q = torch.linalg.eigh(A.double())
+        else:
+            raise exception
+    
+    # Make positive semidefinite and add epsilon
+    L = torch.maximum(L, torch.zeros_like(L))
+    L += epsilon
+    
+    # Compute inverse root
+    X = Q * L.pow(alpha).unsqueeze(0) @ Q.T
+    
+    return X
+
+
+def matrix_inverse_root_fast_asymmetric(
+    A: Tensor,
+    root: int,
+    epsilon: float = 0.0,
+    exponent_multiplier: float = 1.0,
+    is_diagonal: Union[Tensor, bool] = False,
+    retry_double_precision: bool = True,
+) -> Tensor:
+    """
+    Optimized fast path for asymmetric non-adaptive configuration.
+    Single epsilon value per call, no condition checking.
+    
+    Args:
+        A (Tensor): Square matrix of interest.
+        root (int): Root of interest. Any natural number.
+        epsilon (float): Adds epsilon * I to matrix before taking matrix root. (Default: 0.0)
+        exponent_multiplier (float): exponent multiplier in the eigen method (Default: 1.0)
+        is_diagonal (Tensor, bool): Flag for whether or not matrix is diagonal.
+        retry_double_precision (bool): Flag for re-trying eigendecomposition with higher precision.
+
+    Returns:
+        X (Tensor): Inverse root of matrix A.
+    """
+    
+    # check if matrix is scalar
+    if torch.numel(A) == 1:
+        alpha = torch.as_tensor(-exponent_multiplier / root)
+        return (A + epsilon) ** alpha
+
+    # check matrix shape
+    if len(A.shape) != 2:
+        raise ValueError("Matrix is not 2-dimensional!")
+    elif A.shape[0] != A.shape[1]:
+        raise ValueError("Matrix is not square!")
+
+    if is_diagonal:
+        return matrix_root_diagonal(
+            A=A,
+            root=root,
+            epsilon=epsilon,
+            inverse=True,
+            exponent_multiplier=exponent_multiplier,
+            return_full_matrix=True,
+        )
+    
+    # Fast eigendecomposition path with cached epsilon
+    alpha = -exponent_multiplier / root
+    
+    try:
+        L, Q = torch.linalg.eigh(A)
+    except Exception as exception:
+        if retry_double_precision and A.dtype != torch.float64:
+            logger.warning(
+                f"Failed to compute eigendecomposition in {A.dtype} precision with exception {exception}! "
+                f"Retrying in double precision..."
+            )
+            L, Q = torch.linalg.eigh(A.double())
+        else:
+            raise exception
+    
+    # Make positive semidefinite 
+    L = torch.maximum(L, torch.zeros_like(L))
+    # Direct epsilon addition (no branching)
+    L += epsilon
+    
+    # Compute inverse root
+    X = Q * L.pow(alpha).unsqueeze(0) @ Q.T
+    
+    return X
+
 
 def compute_condition_based_epsilon_gpu(
     eigenvalues: Tensor,

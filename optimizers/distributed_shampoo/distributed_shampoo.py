@@ -291,7 +291,7 @@ class DistributedShampoo(torch.optim.Optimizer):
         use_merge_dims: bool = True,
         use_pytorch_compile: bool = False,
         distributed_config: Optional[DistributedConfig] = None,
-        preconditioner_dtype: torch.dtype = torch.float,
+        preconditioner_dtype: torch.dtype = torch.float64,
         use_protected_eigh: bool = True,
         track_root_inv_residuals: bool = False,
     ) -> None:
@@ -308,8 +308,16 @@ class DistributedShampoo(torch.optim.Optimizer):
             )
         if not epsilon > 0.0:
             raise ValueError(f"Invalid epsilon value: {epsilon}. Must be > 0.0.")
+        
+        # Optimize epsilon configuration for default and asymmetric cases
         actual_epsilon_left = epsilon_left if epsilon_left is not None else epsilon
         actual_epsilon_right = epsilon_right if epsilon_right is not None else epsilon
+        
+        # Fast check for default configuration
+        is_default_config = (not use_adaptive_epsilon and 
+                           epsilon_left is None and 
+                           epsilon_right is None)
+        
         if not 0.0 <= momentum < 1.0:
             raise ValueError(
                 f"Invalid momentum parameter: {momentum}. Must be [0.0, 1.0)."
@@ -385,6 +393,7 @@ class DistributedShampoo(torch.optim.Optimizer):
                 EPSILON_RIGHT: actual_epsilon_right,
                 'USE_ADAPTIVE_EPSILON' : use_adaptive_epsilon,
                 'CONDITION_THRESHOLDS' : condition_thresholds,
+                'IS_DEFAULT_CONFIG': is_default_config,  # Store for fast path
                 MOMENTUM: momentum,
                 WEIGHT_DECAY: weight_decay,
                 MAX_PRECONDITIONER_DIM: max_preconditioner_dim,
@@ -499,6 +508,7 @@ class DistributedShampoo(torch.optim.Optimizer):
                 epsilon_right = group[EPSILON_RIGHT],
                 use_adaptive_epsilon = group.get('USE_ADAPTIVE_EPSILON', False),
                 condition_thresholds = group.get('CONDITION_THRESHOLDS', None),
+                is_default_config = group.get('IS_DEFAULT_CONFIG', False),  # Pass optimization flag
                 inv_root_override=group[INV_ROOT_OVERRIDE],
                 exponent_multiplier=group[EXPONENT_MULTIPLIER],
                 use_bias_correction=group[USE_BIAS_CORRECTION],
@@ -506,6 +516,7 @@ class DistributedShampoo(torch.optim.Optimizer):
                 use_protected_eigh=self._use_protected_eigh,
             )
 
+    # ... rest of the methods remain the same ...
     @torch.no_grad()
     def _instantiate_grafting(self) -> None:
         for state_lists, group in zip(

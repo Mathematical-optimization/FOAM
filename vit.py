@@ -1,7 +1,9 @@
 import os
 from xml.parsers.expat import model
 import torch
+import numpy as np
 import torch.nn as nn
+import random
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
@@ -32,6 +34,38 @@ from optimizers.distributed_shampoo.shampoo_types import (
     DDPShampooConfig,
     CommunicationDType
 )
+
+def set_seed(seed : int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+        os.environ['PYTHONHASHSEED'] = str(seed)
+
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+
+def set_seed_distributed(seed: int = 42, rank: int = 0):
+    rank_seed = seed + rank
+    
+    random.seed(rank_seed)
+    np.random.seed(rank_seed)
+    torch.manual_seed(rank_seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(rank_seed)
+        torch.cuda.manual_seed_all(rank_seed)
+    
+    os.environ['PYTHONHASHSEED'] = str(rank_seed)
+    
+    # 성능 최적화 유지
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    
+    print(f"Rank {rank}: Seed set to {rank_seed} (base seed: {seed})")
 
 class EighFallbackCounter(logging.Handler):
     """'eigh' 연산이 float64로 재시도될 때 발생하는 경고를 카운트합니다."""
@@ -330,7 +364,7 @@ def get_epsilon_config(args):
     # 프리셋 설정
     presets = {
         'default': {
-            'epsilon': 1e-08,
+            'epsilon': 1e-10,
             'epsilon_left': None,  # None이면 epsilon 값 사용
             'epsilon_right': None,
             'use_adaptive_epsilon': False,
@@ -402,10 +436,18 @@ def train(args: argparse.Namespace):
     global_rank = dist.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = dist.get_world_size()
+
+    set_seed_distributed(seed = args.seed, rank = global_rank)
     
     print(f"Running DDP training. Global Rank: {global_rank}, Local Rank: {local_rank}, World Size: {world_size}")
 
     writer = SummaryWriter(log_dir=args.log_dir) if global_rank == 0 else None
+    def seed_worker(worker_id):
+
+        worker_seed = torch.initial_seed()
+        np_seed = worker_seed % (2**32)
+        np.random.seed(np_seed)
+        random.seed(worker_seed)
 
     # 데이터 변환 설정
     train_transform = create_transform(
@@ -454,14 +496,15 @@ def train(args: argparse.Namespace):
         }
 
     # DataLoader 설정
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True, seed= args.seed)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, 
-                             num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+                             num_workers=args.workers, pin_memory=True, collate_fn=collate_fn, worker_init_fn = seed_worker, generator = torch.Generator().manual_seed(args.seed))
     
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False, seed = args.seed)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, 
-                           num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+                           num_workers=args.workers, pin_memory=True, collate_fn=collate_fn, worker_init_fn = seed_worker, generator = torch.Generator().manual_seed(args.seed))
 
+    torch.manual_seed(args.seed)
     # 모델 생성
     vit_s16_params = {
         'img_size': 224, 'patch_size': 16, 'embedding_dim': 384, 'depth': 12,
@@ -487,14 +530,14 @@ def train(args: argparse.Namespace):
         momentum=False,
         weight_decay=args.weight_decay,
         max_preconditioner_dim=1024,
-        precondition_frequency=100,
+        precondition_frequency=25,
         use_normalized_grafting=False,
         inv_root_override=2,
         exponent_multiplier=1,
-        start_preconditioning_step=100,
+        start_preconditioning_step=25,
         use_nadam=False,
         use_decoupled_weight_decay=True,
-        preconditioner_dtype = torch.float64,
+        preconditioner_dtype=torch.float32,
         grafting_config=AdamGraftingConfig(beta2=0.99, epsilon=1e-08),
         distributed_config=DDPShampooConfig(
             communication_dtype=CommunicationDType.FP32,
@@ -697,10 +740,12 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
     
     parser.add_argument('--epsilon-preset', type = str, default = 'default', choices = ['default', 'asymmetric', 'adaptive', 'adaptive_asymmetric' ], help = 'Epsilon configuration preset')
-    parser.add_argument('--epsilon', type= float, default = 1e-08)
+    parser.add_argument('--epsilon', type= float, default = 1e-10)
     parser.add_argument('--epsilon-left', type = float, default = None)
     parser.add_argument('--epsilon-right', type = float, default = None)
     parser.add_argument('--use-adaptive-epsilon', action = 'store_true')
     parser.add_argument('--condition-thresholds', type = str, default= '1e6:1e-5, 1e8:5e-5')
+
+    parser.add_argument('--seed', type = int, default = 42, help = 'Random seed for reproducibility (default : 42)')
     args = parser.parse_args()
     train(args)

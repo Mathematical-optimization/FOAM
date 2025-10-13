@@ -17,7 +17,7 @@ N_GPUS=4
 DATA_PATH="$HOME/.cache/huggingface/datasets"
 
 # TensorBoard 로그 및 모델 체크포인트를 저장할 기본 경로
-OUTPUT_DIR="./training_output_1010"
+OUTPUT_DIR="./training_output_1013"
 
 # Python 스크립트 파일 이름
 SCRIPT_NAME="vit.py"

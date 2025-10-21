@@ -364,7 +364,7 @@ def get_epsilon_config(args):
     # 프리셋 설정
     presets = {
         'default': {
-            'epsilon': 1e-10,
+            'epsilon': 1e-08,
             'epsilon_left': None,  # None이면 epsilon 값 사용
             'epsilon_right': None,
             'use_adaptive_epsilon': False,
@@ -372,8 +372,8 @@ def get_epsilon_config(args):
         },
         'asymmetric': {
             'epsilon': 1e-08,
-            'epsilon_left': 1e-8,
-            'epsilon_right': 8e-5,
+            'epsilon_left': 1e-07,
+            'epsilon_right': 1e-05,
             'use_adaptive_epsilon': False,
             'condition_thresholds': None
         },
@@ -530,11 +530,11 @@ def train(args: argparse.Namespace):
         momentum=False,
         weight_decay=args.weight_decay,
         max_preconditioner_dim=1024,
-        precondition_frequency=25,
+        precondition_frequency=800,
         use_normalized_grafting=False,
         inv_root_override=2,
         exponent_multiplier=1,
-        start_preconditioning_step=25,
+        start_preconditioning_step=800,
         use_nadam=False,
         use_decoupled_weight_decay=True,
         preconditioner_dtype=torch.float32,

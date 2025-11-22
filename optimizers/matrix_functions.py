@@ -284,7 +284,7 @@ def matrix_inverse_root(
             return_full_matrix=True,
         )
     elif root_inv_method == RootInvMethod.EIGEN:
-        X, used_epsilon = _matrix_root_eigen_optimized(
+        X, used_epsilon, L_out, Q_out = _matrix_root_eigen_optimized(
             A=A,
             root=root,
             epsilon=epsilon,
@@ -321,7 +321,7 @@ def matrix_inverse_root(
             f"Root inverse method is not implemented! Specified root inverse method is {str(root_inv_method)}."
         )
 
-    return X, used_epsilon
+    return X, used_epsilon, L_out, Q_out
 
 
 def matrix_root_diagonal(
@@ -379,13 +379,15 @@ def _matrix_root_eigen_optimized(
     thresholds_tensor: Optional[Tensor] = None,
     epsilons_tensor: Optional[Tensor] = None,
     small_positive_tensor: Optional[Tensor] = None,
-) -> Tuple[Tensor, Union[float, Tensor]]: 
+) -> Tuple[Tensor, Union[float, Tensor], Tensor, Tensor]: 
     """
     Optimized eigendecomposition-based matrix root computation with adaptive epsilon.
     
     Returns:
         X: (Inverse) root of matrix
         used_epsilon: Actually used epsilon (Tensor or float)
+        L: Eigenvalues (vector)
+        Q: Eigenvectors (matrix)
     """
 
     # Check if root is positive integer
@@ -439,7 +441,7 @@ def _matrix_root_eigen_optimized(
     # Compute inverse preconditioner
     X = Q * L.pow(alpha).unsqueeze(0) @ Q.T
 
-    return X, used_epsilon_tensor
+    return X, used_epsilon_tensor, L, Q
 
 
 def _matrix_inverse_root_newton(
@@ -549,7 +551,7 @@ def compute_matrix_root_inverse_residuals(
         raise ValueError("Matrix shapes do not match!")
 
     # compute error by comparing against double precision
-    X, _ = matrix_inverse_root(
+    X, _, _, _ = matrix_inverse_root(
         A.double(), root, epsilon=epsilon, exponent_multiplier=exponent_multiplier, use_adaptive_epsilon=False
     )
     relative_error = torch.dist(X, X_hat, p=torch.inf) / torch.norm(X, p=torch.inf)
@@ -558,7 +560,7 @@ def compute_matrix_root_inverse_residuals(
     if exponent_multiplier == 1.0:
         X_invr = torch.linalg.matrix_power(X_hat.double(), n=-root)
     else:
-        X_invr, _ = _matrix_root_eigen_optimized(
+        X_invr, _, _, _ = _matrix_root_eigen_optimized(
             X_hat.double(),
             root=1,
             epsilon=0.0,

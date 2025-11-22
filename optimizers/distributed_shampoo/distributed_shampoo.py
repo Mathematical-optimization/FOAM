@@ -414,6 +414,7 @@ class DistributedShampoo(torch.optim.Optimizer):
                 USE_MERGE_DIMS: use_merge_dims,
                 PRECONDITIONER_DTYPE: preconditioner_dtype,
                 'USE_TRACE_CORRECTION' : use_trace_correction,
+                "matrix_root_inv_threshold":matrix_root_inv_threshold,
             },
         )
 

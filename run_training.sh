@@ -17,7 +17,7 @@ N_GPUS=4
 DATA_PATH="$HOME/.cache/huggingface/datasets"
 
 # TensorBoard 로그 및 모델 체크포인트를 저장할 기본 경로
-OUTPUT_DIR="./training_output_1112"
+OUTPUT_DIR="./training_output_1122"
 
 # Python 스크립트 파일 이름
 SCRIPT_NAME="vit.py"
@@ -58,8 +58,8 @@ if [ "$EPSILON_PRESET" == "default" ]; then
     echo "Selected Preset: DEFAULT"
     echo "  - All matrices use same epsilon: 1e-10"
     echo "  - Non-adaptive (fixed epsilon)"
-    echo "  - Left Matrix Epsilon: 1e-10"
-    echo "  - Right Matrix Epsilon: 1e-10"
+    echo "  - Left Matrix Epsilon: 1e-08"
+    echo "  - Right Matrix Epsilon: 1e-08"
     echo "  - Adaptive Mode: DISABLED"
     EPSILON_DESC="default"
 elif [ "$EPSILON_PRESET" == "asymmetric" ]; then

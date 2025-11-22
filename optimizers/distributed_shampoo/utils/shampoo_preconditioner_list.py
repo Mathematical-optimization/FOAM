@@ -449,6 +449,8 @@ class ShampooKroneckerFactors(OptimizerModule):
     inv_factor_matrices: Tuple[Tensor, ...]
     factor_matrix_indices: Tuple[str, ...]
     is_factor_matrices_diagonal: Tuple[Tensor, ...] = field(init=False)
+    eigenvalues: List[Optional[Tensor]] = field(default_factory=list)
+    eigenvectors: List[Optional[Tensor]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -460,6 +462,8 @@ class ShampooKroneckerFactors(OptimizerModule):
         self.is_factor_matrices_diagonal = tuple(
             torch.tensor(True) for _ in self.factor_matrices
         )
+        self.eigenvalues = [None] * len(self.factor_matrices)
+        self.eigenvectors = [None] * len(self.factor_matrices)  
 
 
 class ShampooPreconditionerList(PreconditionerList):
@@ -510,18 +514,22 @@ class ShampooPreconditionerList(PreconditionerList):
         use_bias_correction: bool = True,
         factor_matrix_dtype: torch.dtype = torch.float,
         use_protected_eigh: bool = True,
+        use_trace_correction: bool = False,
+        matrix_root_inv_threshold: float = 0.0,
     ) -> None:
         super().__init__(block_list)
 
         # Initialize parameters.
         self._beta2 = beta2
         self._epsilon = epsilon
+        self._use_trace_correction = use_trace_correction
         self._epsilon_left = epsilon_left if epsilon_left is not None else epsilon
         self._epsilon_right = epsilon_right if epsilon_right is not None else epsilon
         self._use_adaptive_epsilon = use_adaptive_epsilon
         self._condition_thresholds = condition_thresholds or (
             {1e6: 1e-5, 1e8: 1e-4} if use_adaptive_epsilon else None
         )
+        self._matrix_root_inv_threshold = matrix_root_inv_threshold
         
         # Optimization: Fast path detection
         self._is_default_config = is_default_config
@@ -553,11 +561,26 @@ class ShampooPreconditionerList(PreconditionerList):
         kronecker_factors_list = []
         epsilon_per_dim_list = [] if self._use_per_dim_epsilon else None
         
+        def _compute_relative_condition_number(
+            self,
+            factor_matrix : Tensor,
+            prev_eigenvectors : Tensor,
+            prev_eigenvalues : Tensor,
+            epsilon : float
+        ) -> Tensor:
+            L_tilde = torch.linalg.multi_dot([prev_eigenvectors.T, factor_matrix, prev_eigenvectors])
+            d_term = torch.sqrt(prev_eigenvalues + epsilon)
+            denominator = torch.outer(d_term, d_term)
+            numerator = L_tilde - torch.diag(prev_eigenvalues)
+            scaled_diff = numerator / denominator
+            rc_t = torch.linalg.norm(scaled_diff, ord = 'fro')
+            return rc_t
+        
         # Pre-compute epsilon tensors for asymmetric non-adaptive case
         if self._is_asymmetric_non_adaptive and len(block_list) > 0:
             device = block_list[0].device
-            self._epsilon_left_tensor = torch.tensor(self._epsilon_left, device=device, dtype=torch.float64)
-            self._epsilon_right_tensor = torch.tensor(self._epsilon_right, device=device, dtype=torch.float64)
+            self._epsilon_left_tensor = torch.tensor(self._epsilon_left, device=device, dtype=torch.float32)
+            self._epsilon_right_tensor = torch.tensor(self._epsilon_right, device=device, dtype=torch.float32)
         
         for block, block_info, dims in zip(
             block_list, block_info_list, self._dims_list, 
@@ -809,17 +832,29 @@ class ShampooPreconditionerList(PreconditionerList):
             def precondition_masked_grad(
                 masked_grad: Tensor,
                 inv_factor_matrices: Tuple[Tensor, ...],
+                factor_matrices : Tuple[Tensor, ...],
+                use_trace_correction : bool =True,
             ) -> Tensor:
+                
                 for inv_factor_matrix in inv_factor_matrices:
                     masked_grad = torch.tensordot(
                         masked_grad, inv_factor_matrix, [[0], [0]]
                     )
+                if use_trace_correction and len(factor_matrices) >= 1:
+                    L_matrix = factor_matrices[0] / self._bias_correction2
+                    trace_L = torch.trace(L_matrix)
+
+                    if trace_L > 1e-10:
+                        masked_grad = masked_grad / trace_L
+
                 return masked_grad
 
             return tuple(
                 precondition_masked_grad(
                     masked_grad=masked_grad,
                     inv_factor_matrices=kronecker_factors.inv_factor_matrices,
+                    factor_matrices = kronecker_factors.factor_matrices,
+                    use_trace_correction = self._use_trace_correction,
                 )
                 for masked_grad, kronecker_factors in zip(
                     masked_grad_list, self._masked_kronecker_factors_list, 
@@ -834,6 +869,8 @@ class ShampooPreconditionerList(PreconditionerList):
         factor_matrix_index: str,
         root: int,
         epsilon_value: float,
+        kronecker_factors : ShampooKroneckerFactors,
+        factor_idx : int
     ) -> None:
         """Compute root inverse for a single factor matrix."""
         # For tracking diagonality of the preconditioner.
@@ -849,7 +886,28 @@ class ShampooPreconditionerList(PreconditionerList):
         bias_corrected_factor_matrix = (
             factor_matrix / self._bias_correction2
         )
-
+        should_update = True
+        if (self._matrix_root_inv_threshold > 0.0 and
+        kronecker_factors.eigenvectors[factor_idx] is not None):
+            try:
+                rc_t = self._compute_relative_condition_number(
+                    bias_corrected_factor_matrix,
+                    kronecker_factors.eigenvectors[factor_idx],
+                    kronecker_factors.eigenvalues[factor_idx],
+                    epsilon_value
+                )
+                if rc_t < self._matrix_root_inv_threshold:
+                    should_update = False
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"Skpping update for {factor_matrix_index} : RC_t {rc_t:.4e} < {self._matrix_root_inv_threshold:.4e}")
+                else:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"Updating {factor_matrix_index} : RC_t {rc_t:.4e} > {self._matrix_root_inv_threshold:.4e} ")
+            except Exception as e:
+                logger.warning(f"Failed to computed RC_t for {factor_matrix_index}, forcing update. Error:{e}")
+                should_update = True
+        if not should_update:
+            return
         # Check for nan or inf values.
         if torch.isnan(bias_corrected_factor_matrix).any():
             raise ValueError(
@@ -888,10 +946,15 @@ class ShampooPreconditionerList(PreconditionerList):
                 retry_double_precision=self._use_protected_eigh,
             )
             
-            computed_inv_factor_matrix, used_epsilon_tensor = result
+            computed_inv_factor_matrix, used_epsilon_tensor, L, Q = result
             computed_inv_factor_matrix = computed_inv_factor_matrix.to(
                 dtype=inv_factor_matrix.dtype
             )
+            if L is not None and Q is not None:
+                kronecker_factors.eigenvalues[factor_idx] = L.to(dtype = factor_matrix.dtype)
+                kronecker_factors.eigenvectors[factor_idx] = Q.to(dtype = factor_matrix.dtype)
+            
+            
 
             if self._use_adaptive_epsilon and logger.isEnabledFor(logging.DEBUG):
                 if isinstance(used_epsilon_tensor, torch.Tensor):
@@ -913,7 +976,7 @@ class ShampooPreconditionerList(PreconditionerList):
                     f"To mitigate, check factor matrix before matrix inverse root computation: "
                     f"{bias_corrected_factor_matrix=}"
                 )
-
+            computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype = inv_factor_matrix.dtype)
             inv_factor_matrix.copy_(computed_inv_factor_matrix)
 
         except Exception as exception:
@@ -1038,6 +1101,7 @@ class ShampooPreconditionerList(PreconditionerList):
                     self._local_epsilon_per_dim_list,
                 ):
                     for (
+                        i,
                         factor_matrix,
                         inv_factor_matrix,
                         is_factor_matrix_diagonal,
@@ -1055,8 +1119,10 @@ class ShampooPreconditionerList(PreconditionerList):
                             inv_factor_matrix,
                             is_factor_matrix_diagonal,
                             factor_matrix_index,
-                            root,
-                            epsilon_for_this_dim,
+                            kronecker_factors = kronecker_factors,
+                            factor_idx = i,
+                            root = root,
+                            epsilon_for_this_dim = epsilon_for_this_dim,
                         )
 
     def compress_preconditioner_list(

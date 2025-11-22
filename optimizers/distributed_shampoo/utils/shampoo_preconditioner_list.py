@@ -1124,6 +1124,34 @@ class ShampooPreconditionerList(PreconditionerList):
                             root = root,
                             epsilon_for_this_dim = epsilon_for_this_dim,
                         )
+            else:
+                for kronecker_factors, root in zip(
+                    self._local_kronecker_factors_list,
+                    self._local_root_list,
+                ):
+                    for (
+                        i,
+                        factor_matrix,
+                        inv_factor_matrix,
+                        is_factor_matrix_diagonal,
+                        factor_matrix_index,
+                    ) in zip(
+                        range(len(kronecker_factors.factor_matrices)),
+                        kronecker_factors.factor_matrices,
+                        kronecker_factors.inv_factor_matrices,
+                        kronecker_factors.is_factor_matrices_diagonal,
+                        kronecker_factors.factor_matrix_indices,
+                    ):
+                        self._compute_single_root_inverse(
+                            factor_matrix,
+                            inv_factor_matrix,
+                            is_factor_matrix_diagonal,
+                            factor_matrix_index,
+                            kronecker_factors = kronecker_factors,
+                            factor_idx = i,
+                            root = root,
+                            epsilon_value = self._epsilon,
+                        )
 
     def compress_preconditioner_list(
         self, local_grad_selector: Tuple[bool, ...]

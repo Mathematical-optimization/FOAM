@@ -618,14 +618,14 @@ def train(args: argparse.Namespace):
         max_preconditioner_dim=args.max_preconditioner_dim,
         precondition_frequency=args.precondition_frequency,
         start_preconditioning_step=args.start_preconditioning_step,
-        grafting_config=None,
         grafting_config=AdamGraftingConfig(beta2=args.adam_grafting_beta2, epsilon=args.grafting_epsilon),
         use_normalized_grafting=False,
         use_decoupled_weight_decay=True,
         inv_root_override=2,
         exponent_multiplier=1,
         distributed_config=distributed_config,
-        preconditioner_dtype=torch.float32
+        preconditioner_dtype=torch.float32,
+        matrix_root_inv_threshold=args.matrix_root_inv_threshold,
     )
 
     # Eigh Fallback Counter 설정
@@ -980,8 +980,8 @@ if __name__ == '__main__':
     parser.add_argument('--adam-grafting-beta2', type=float, default=0.99, help='Adam grafting beta2')
     parser.add_argument('--grafting-epsilon', type=float, default=1e-10, help='Grafting epsilon')
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024, help='Max preconditioner dimension')
-    parser.add_argument('--precondition-frequency', type=int, default=1, help='Preconditioning frequency')
-    parser.add_argument('--start-preconditioning-step', type=int, default=1, help='Start preconditioning step')
+    parser.add_argument('--precondition-frequency', type=int, default=10, help='Preconditioning frequency')
+    parser.add_argument('--start-preconditioning-step', type=int, default=10, help='Start preconditioning step')
     parser.add_argument('--mixup', type=float, default=0.2, help='Mixup alpha')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing')
     parser.add_argument('--log-interval', type=int, default=20, help='Logging interval')
@@ -989,6 +989,7 @@ if __name__ == '__main__':
     parser.add_argument('--save-dir', type=str, default='checkpoints', help='Checkpoint directory')
     parser.add_argument('--resume', type=str, default='', help='Resume from checkpoint')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.0, help='Matrix root inverse threshold')
     
     # Epsilon configuration options
     parser.add_argument('--epsilon-preset', type=str, default='default',

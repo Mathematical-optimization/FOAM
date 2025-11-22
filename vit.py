@@ -1,5 +1,4 @@
 import os
-from xml.parsers.expat import model
 import torch
 import numpy as np
 import torch.nn as nn
@@ -11,7 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 import math
 import argparse
 from torch.utils.tensorboard import SummaryWriter
@@ -160,13 +159,43 @@ class EnhancedWallClockProfiler:
 wall_clock_profiler = EnhancedWallClockProfiler(use_cuda_sync=True)
 
 # ========================================
-# Modified Shampoo Components with Timing
+# Monitoring Classes
 # ========================================
 
-# Monkey-patching을 위한 래퍼 함수들은 직접 train() 함수 내에서 정의
+class EighMonitor:
+    """
+    torch.linalg.eigh 호출 횟수를 모니터링하는 클래스.
+    에폭별 카운트와 구간별 카운트를 모두 지원합니다.
+    """
+    def __init__(self):
+        self.epoch_count = 0
+        self.total_count = 0
+        self.original_eigh = torch.linalg.eigh
+
+    def eigh_wrapper(self, A, UPLO='L', *, out=None):
+        self.epoch_count += 1
+        self.total_count += 1
+        return self.original_eigh(A, UPLO, out=out)
+
+    def reset_epoch(self):
+        self.epoch_count = 0
+
+def count_total_shampoo_factors(optimizer):
+    """옵티마이저가 관리하는 전체 Factor 행렬(L, R)의 개수를 반환합니다."""
+    total_count = 0
+    if hasattr(optimizer, '_per_group_state_lists'):
+        for state_lists in optimizer._per_group_state_lists:
+            # 'shampoo_preconditioner_list' 키 사용
+            if 'shampoo_preconditioner_list' in state_lists:
+                preconditioner_list = state_lists['shampoo_preconditioner_list']
+                # 각 파라미터 블록별로 순회
+                for kronecker_factors in preconditioner_list._masked_kronecker_factors_list:
+                    # 각 블록의 Factor 행렬(L, R 등) 개수 더하기
+                    total_count += len(kronecker_factors.factor_matrices)
+    return total_count
 
 # ========================================
-# ViT Model Components (unchanged)
+# ViT Model Components
 # ========================================
 
 def set_seed(seed : int = 42):
@@ -304,7 +333,7 @@ class VisionTransformer(nn.Module):
         return logits
 
 # ========================================
-# Utility Functions (keeping essential ones)
+# Utility Functions
 # ========================================
 
 def validate_checkpoint_completeness(optimizer_state, model):
@@ -475,7 +504,7 @@ def get_epsilon_config(args):
     return config
 
 # ========================================
-# Modified Training Function with Enhanced Timing
+# Main Training Function
 # ========================================
 
 def train(args: argparse.Namespace):
@@ -573,20 +602,23 @@ def train(args: argparse.Namespace):
     criterion = nn.CrossEntropyLoss().to(local_rank)
     epsilon_config = get_epsilon_config(args)
 
-    # Monkey-patch torch.linalg.eigh for timing
-    original_torch_eigh = torch.linalg.eigh
-    def timed_torch_eigh(A, UPLO='L', *, out = None):
+    # Initialize Eigh Monitor
+    eigh_monitor = EighMonitor()
+    eigh_monitor.original_eigh = torch.linalg.eigh
+
+    # Combined Wrapper: Monitor (Count) + Profiler (Time)
+    def monitored_timed_eigh(A, UPLO='L', *, out=None):
         wall_clock_profiler.start_timer("eigendecomposition")
         try:
-            result = original_torch_eigh(A, UPLO, out= out)
+            result = eigh_monitor.eigh_wrapper(A, UPLO, out=out)
         finally:
             wall_clock_profiler.end_timer("eigendecomposition")
         return result
     
-    torch.linalg.eigh = timed_torch_eigh
+    torch.linalg.eigh = monitored_timed_eigh
     
     if global_rank == 0:
-        print("torch.linalg.eigh has been patched for timing measurement")
+        print("torch.linalg.eigh has been patched for timing measurement and call counting.")
 
     # Monkey-patch Shampoo compute_root_inverse for timing
     from optimizers.distributed_shampoo.utils.shampoo_preconditioner_list import ShampooPreconditionerList
@@ -628,6 +660,11 @@ def train(args: argparse.Namespace):
         matrix_root_inv_threshold=args.matrix_root_inv_threshold,
     )
 
+    # Calculate total Shampoo factors per rank
+    total_factor_matrices = count_total_shampoo_factors(optimizer)
+    if global_rank == 0:
+        print(f"Total Shampoo Factor Matrices per Rank: {total_factor_matrices}")
+
     # Eigh Fallback Counter 설정
     start_epoch = 0
     cumulative_fallback_count = 0
@@ -666,8 +703,11 @@ def train(args: argparse.Namespace):
     
     # Training loop with enhanced timing
     for epoch in range(start_epoch, args.epochs):
-        # Reset per-epoch timing stats
+        # Reset per-epoch timing and counting stats
         wall_clock_profiler.reset_epoch_timers(epoch)
+        eigh_monitor.reset_epoch()
+        update_events_in_epoch = 0
+        
         epoch_start_time = time.perf_counter()
         
         train_sampler.set_epoch(epoch)
@@ -690,6 +730,13 @@ def train(args: argparse.Namespace):
             epoch_data_loading_time += data_loading_time
             
             current_step = epoch * len(train_loader) + i
+            
+            # Track Shampoo Update Events
+            current_global_step_for_shampoo = current_step + 1 # Shampoo steps are 1-indexed usually
+            if (current_global_step_for_shampoo >= args.start_preconditioning_step and 
+                current_global_step_for_shampoo % args.precondition_frequency == 0):
+                update_events_in_epoch += 1
+
             images = batch['pixel_values'].to(local_rank, non_blocking=True)
             labels = batch['label'].to(local_rank, non_blocking=True)
             
@@ -833,6 +880,11 @@ def train(args: argparse.Namespace):
         # Calculate total elapsed time
         total_elapsed = time.perf_counter() - wall_clock_profiler.training_start_time
         
+        # Shampoo Update Percentage Calculation
+        actual_eigh_calls = eigh_monitor.epoch_count
+        max_possible_calls = update_events_in_epoch * total_factor_matrices
+        update_percentage = (actual_eigh_calls / max_possible_calls * 100.0) if max_possible_calls > 0 else 0.0
+
         # Enhanced results output with proper timing
         if global_rank == 0:
             print(f"\n{'='*80}")
@@ -867,6 +919,13 @@ def train(args: argparse.Namespace):
             if epoch_root_inv > 0:
                 print(f"  Eigendecomp/Root-Inv Ratio: {epoch_eigendecomp/epoch_root_inv*100:.1f}%")
             
+            # Shampoo Update Stats
+            print(f"\nShampoo Update Statistics:")
+            print(f"  - Update Events: {update_events_in_epoch}")
+            print(f"  - Max Possible Matrix Updates: {max_possible_calls}")
+            print(f"  - Actual Matrix Updates: {actual_eigh_calls}")
+            print(f"  - Update Percentage: {update_percentage:.2f}% (Threshold: {args.matrix_root_inv_threshold})")
+
             # Note: The epoch Shampoo times should be part of Optimizer Step
             if epoch_eigendecomp + epoch_root_inv > 0:
                 shampoo_pct_of_optimizer = (epoch_eigendecomp + epoch_root_inv) / timing_tensors[3].item() * 100
@@ -895,6 +954,9 @@ def train(args: argparse.Namespace):
                 writer.add_scalar('Timing/epoch_root_inv', epoch_root_inv, epoch)
                 writer.add_scalar('Timing/cumulative_eigendecomp', cumulative_eigendecomp, epoch)
                 writer.add_scalar('Timing/cumulative_root_inv', cumulative_root_inv, epoch)
+                writer.add_scalar('Shampoo/Eigh_Update_Percentage', update_percentage, epoch)
+                writer.add_scalar('Shampoo/Actual_Eigh_Count', actual_eigh_calls, epoch)
+                writer.add_scalar('Shampoo/Update_Events_Count', update_events_in_epoch, epoch)
         
         # Save checkpoint (simplified)
         if (epoch + 1) % args.save_interval == 0:
@@ -989,7 +1051,7 @@ if __name__ == '__main__':
     parser.add_argument('--save-dir', type=str, default='checkpoints', help='Checkpoint directory')
     parser.add_argument('--resume', type=str, default='', help='Resume from checkpoint')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.0, help='Matrix root inverse threshold')
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.75, help='Matrix root inverse threshold')
     
     # Epsilon configuration options
     parser.add_argument('--epsilon-preset', type=str, default='default',

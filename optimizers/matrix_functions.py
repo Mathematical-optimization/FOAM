@@ -234,7 +234,7 @@ def matrix_inverse_root(
     thresholds_tensor: Optional[Tensor] = None,
     epsilons_tensor: Optional[Tensor] = None,
     small_positive_tensor: Optional[Tensor] = None,
-) -> Tuple[Tensor, Union[float, Tensor]]:
+) -> Tuple[Tensor, Union[float, Tensor], Optional[Tensor], Optional[Tensor]]:
     """Computes matrix root inverse of square symmetric positive definite matrix.
 
     Args:
@@ -273,7 +273,7 @@ def matrix_inverse_root(
         raise ValueError("Matrix is not square!")
     
     used_epsilon = epsilon
-
+    L_out, Q_out = None, None
     if is_diagonal:
         X = matrix_root_diagonal(
             A=A,
@@ -297,6 +297,7 @@ def matrix_inverse_root(
             epsilons_tensor=epsilons_tensor,
             small_positive_tensor=small_positive_tensor,
         )
+
     elif root_inv_method == RootInvMethod.NEWTON:
         # Newton method does not support adaptive epsilon
         if exponent_multiplier != 1.0:

@@ -318,7 +318,8 @@ class DistributedShampoo(torch.optim.Optimizer):
         # Fast check for default configuration
         is_default_config = (not use_adaptive_epsilon and 
                            epsilon_left is None and 
-                           epsilon_right is None)
+                           epsilon_right is None and
+                           matrix_root_inv_threshold == 0.0)
         
         if not 0.0 <= momentum < 1.0:
             raise ValueError(

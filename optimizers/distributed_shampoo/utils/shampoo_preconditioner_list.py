@@ -560,22 +560,7 @@ class ShampooPreconditionerList(PreconditionerList):
         # Instantiate (blocked) Kronecker factors and construct list of Kronecker factors.
         kronecker_factors_list = []
         epsilon_per_dim_list = [] if self._use_per_dim_epsilon else None
-        
-        def _compute_relative_condition_number(
-            self,
-            factor_matrix : Tensor,
-            prev_eigenvectors : Tensor,
-            prev_eigenvalues : Tensor,
-            epsilon : float
-        ) -> Tensor:
-            L_tilde = torch.linalg.multi_dot([prev_eigenvectors.T, factor_matrix, prev_eigenvectors])
-            d_term = torch.sqrt(prev_eigenvalues + epsilon)
-            denominator = torch.outer(d_term, d_term)
-            numerator = L_tilde - torch.diag(prev_eigenvalues)
-            scaled_diff = numerator / denominator
-            rc_t = torch.linalg.norm(scaled_diff, ord = 'fro')
-            return rc_t
-        
+    
         # Pre-compute epsilon tensors for asymmetric non-adaptive case
         if self._is_asymmetric_non_adaptive and len(block_list) > 0:
             device = block_list[0].device
@@ -723,6 +708,21 @@ class ShampooPreconditionerList(PreconditionerList):
             f"Rank {dist.get_rank()}: ShampooPreconditionerList Total Bytes: {sum(self._num_bytes_list)}"
         )
 
+    def _compute_relative_condition_number(
+            self,
+            factor_matrix : Tensor,
+            prev_eigenvectors : Tensor,
+            prev_eigenvalues : Tensor,
+            epsilon : float
+        ) -> Tensor:
+            L_tilde = torch.linalg.multi_dot([prev_eigenvectors.T, factor_matrix, prev_eigenvectors])
+            d_term = torch.sqrt(prev_eigenvalues + epsilon)
+            denominator = torch.outer(d_term, d_term)
+            numerator = L_tilde - torch.diag(prev_eigenvalues)
+            scaled_diff = numerator / denominator
+            rc_t = torch.linalg.norm(scaled_diff, ord = 'fro')
+            return rc_t
+        
     def _initialize_adaptive_epsilon_tensors(self) -> None:
         """Initialize GPU tensors for adaptive epsilon computation once."""
         if not self._condition_thresholds or self._thresholds_tensor is not None:

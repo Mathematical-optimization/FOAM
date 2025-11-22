@@ -291,9 +291,11 @@ class DistributedShampoo(torch.optim.Optimizer):
         use_merge_dims: bool = True,
         use_pytorch_compile: bool = False,
         distributed_config: Optional[DistributedConfig] = None,
-        preconditioner_dtype: torch.dtype = torch.float64,
+        preconditioner_dtype: torch.dtype = torch.float32,
         use_protected_eigh: bool = True,
         track_root_inv_residuals: bool = False,
+        use_trace_correction: bool = False,
+        matrix_root_inv_threshold: float = 0.0,
     ) -> None:
         # Hyperparameter checks.
         if not lr >= 0.0:
@@ -410,6 +412,7 @@ class DistributedShampoo(torch.optim.Optimizer):
                 USE_EMA_MOMENTUM: use_ema_momentum,
                 USE_MERGE_DIMS: use_merge_dims,
                 PRECONDITIONER_DTYPE: preconditioner_dtype,
+                'USE_TRACE_CORRECTION' : use_trace_correction,
             },
         )
 
@@ -514,6 +517,8 @@ class DistributedShampoo(torch.optim.Optimizer):
                 use_bias_correction=group[USE_BIAS_CORRECTION],
                 factor_matrix_dtype=group[PRECONDITIONER_DTYPE],
                 use_protected_eigh=self._use_protected_eigh,
+                use_trace_correction = group.get('USE_TRACE_CORRECTION', False),
+                matrix_root_inv_threshold = group.get("matrix_root_inv_threshold", 0.0),
             )
 
     # ... rest of the methods remain the same ...

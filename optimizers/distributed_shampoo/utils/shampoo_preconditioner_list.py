@@ -1,12 +1,3 @@
-"""
-Copyright (c) Meta Platforms, Inc. and affiliates.
-All rights reserved.
-
-This source code is licensed under the license found in the
-LICENSE file in the root directory of this source tree.
-
-"""
-
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -42,13 +33,7 @@ SHAMPOO = "shampoo"
 
 
 class PreconditionerList(ABC):
-    """Preconditioner base class.
-
-    Args:
-        block_list (Tuple[Tensor, ...]): List of (blocks of) parameters.
-
-    """
-
+    """Preconditioner base class."""
     def __init__(
         self,
         block_list: Tuple[Tensor, ...],
@@ -98,13 +83,7 @@ class PreconditionerList(ABC):
 
 
 class SGDPreconditionerList(PreconditionerList):
-    """SGD (identity) preconditioners for a list of parameters.
-
-    Args:
-        block_list (Tuple[Tensor, ...]): List of (blocks of) parameters.
-
-    """
-
+    """SGD (identity) preconditioners for a list of parameters."""
     def __init__(
         self,
         block_list: Tuple[Tensor, ...],
@@ -128,32 +107,7 @@ class SGDPreconditionerList(PreconditionerList):
 
 
 class RWSAdagradPreconditionerList(PreconditionerList):
-    """Row-Wise Adagrad / Adam / RMSProp preconditioners for a list of parameters.
-
-    Operations are performed in-place with foreach operators.
-
-    NOTE: Does not support sparse gradients at this time.
-
-    To enable Adagrad, set beta2 = 1.0.
-    To enable RMSProp, set beta2 = 0.999.
-    To enable Adam, set beta2 = 0.999, use_bias_correction = True.
-
-    Other variants can also be specified.
-
-    Args:
-        block_list (Tuple[Tensor, ...]): List of (blocks of) parameters.
-        state (DefaultDict[Parameter, Any]): Dictionary containing optimizer state.
-        block_info_list (Tuple[BlockInfo, ...]): List containing corresponding BlockInfo for each block/parameter in block_list.
-            Note that this should have the same length as block_list.
-        distributor_selector (Tuple[bool, ...]): Distributor selector is a boolean list indicating whether a blocked parameter
-            is selected by the current Distributor.
-        beta2 (float): Exponential moving average factor for Adam/RMSprop second moment state. If beta2 = 1., will use
-            unweighted sum. (Default: 1.0)
-        epsilon (float): Epsilon term for regularizing preconditioner to ensure positive definiteness. (Default: 1e-10)
-        use_bias_correction (bool): Flag for using bias correction. (Default: False)
-
-    """
-
+    """Row-Wise Adagrad / Adam / RMSProp preconditioners."""
     def __init__(
         self,
         block_list: Tuple[Tensor, ...],
@@ -165,18 +119,11 @@ class RWSAdagradPreconditionerList(PreconditionerList):
         use_bias_correction: bool = True,
     ) -> None:
         super().__init__(block_list)
-
-        # Instantiate scalar hyperparameters.
         self._beta2 = beta2
         self._epsilon = epsilon
         self._use_bias_correction = use_bias_correction
         self._bias_correction2: Tensor = torch.tensor(1.0)
 
-        # Instantiate (blocked) AdaGrad preconditioners and construct preconditioner list.
-        # NOTE: We need to instantiate the AdaGrad preconditioner states within the optimizer's state dictionary,
-        # and do not explicitly store them as AdagradPreconditionerList attributes here.
-        # This is because the optimizer state is defined per-parameter, but AdagradPreconditionerList is defined
-        # across each parameter group (which includes multiple parameters).
         preconditioner_list = []
         for block, block_info in zip(block_list, block_info_list, ):
             param_index, block_index = block_info.composable_block_ids
@@ -184,7 +131,6 @@ class RWSAdagradPreconditionerList(PreconditionerList):
                 state[block_info.param][block_index] = {}
             block_state = state[block_info.param][block_index]
 
-            # Instantiate AdaGrad optimizer state for this block.
             preconditioner_index = str(param_index) + "." + str(block_index)
             block_state[RWS_ADAGRAD] = block_info.allocate_zeros_tensor(
                 block.shape[0], block.dtype, block.device
@@ -196,7 +142,6 @@ class RWSAdagradPreconditionerList(PreconditionerList):
                 f"for Parameter {param_index} ({block_info.param.shape}), Block {block_index} ({block.shape})."
             )
 
-        # Masked lists are the list of active preconditioners or values after filtering out gradients with None.
         self._local_preconditioner_list: Tuple[Tensor, ...] = compress_list(
             preconditioner_list, distributor_selector
         )
@@ -204,7 +149,6 @@ class RWSAdagradPreconditionerList(PreconditionerList):
             Tensor, ...
         ] = self._local_preconditioner_list
 
-        # Construct lists of bytes and numels for logging purposes.
         self._numel_list: Tuple[int, ...] = tuple(
             preconditioner.numel() for preconditioner in preconditioner_list
         )
@@ -213,7 +157,6 @@ class RWSAdagradPreconditionerList(PreconditionerList):
             for preconditioner in preconditioner_list
         )
 
-        # Log breakdown of number of elements and bytes.
         logger.info(
             f"Rank {dist.get_rank()}: RWSAdaGradPreconditionerList Numel Breakdown: {self._numel_list}"
         )
@@ -253,7 +196,6 @@ class RWSAdagradPreconditionerList(PreconditionerList):
                     alpha=1.0 - self._beta2,
                 )
 
-            # Update bias correction term based on step list.
             if self._use_bias_correction and self._beta2 < 1.0:
                 self._bias_correction2 = torch.tensor(1.0) - self._beta2**step
 
@@ -286,34 +228,8 @@ class RWSAdagradPreconditionerList(PreconditionerList):
             )
 
 
-
 class AdagradPreconditionerList(PreconditionerList):
-    """Adagrad / Adam / RMSProp preconditioners for a list of parameters.
-
-    Operations are performed in-place with foreach operators.
-
-    NOTE: Does not support sparse gradients at this time.
-
-    To enable Adagrad, set beta2 = 1.0.
-    To enable RMSProp, set beta2 = 0.999.
-    To enable Adam, set beta2 = 0.999, use_bias_correction = True.
-
-    Other variants can also be specified.
-
-    Args:
-        block_list (Tuple[Tensor, ...]): List of (blocks of) parameters.
-        state (DefaultDict[Parameter, Any]): Dictionary containing optimizer state.
-        block_info_list (Tuple[BlockInfo, ...]): List containing corresponding BlockInfo for each block/parameter in block_list.
-            Note that this should have the same length as block_list.
-        distributor_selector (Tuple[bool, ...]): Distributor selector is a boolean list indicating whether a blocked parameter
-            is selected by the current Distributor.
-        beta2 (float): Exponential moving average factor for Adam/RMSprop second moment state. If beta2 = 1., will use
-            unweighted sum. (Default: 1.0)
-        epsilon (float): Epsilon term for regularizing preconditioner to ensure positive definiteness. (Default: 1e-10)
-        use_bias_correction (bool): Flag for using bias correction. (Default: False)
-
-    """
-
+    """Adagrad / Adam / RMSProp preconditioners."""
     def __init__(
         self,
         block_list: Tuple[Tensor, ...],
@@ -325,18 +241,11 @@ class AdagradPreconditionerList(PreconditionerList):
         use_bias_correction: bool = True,
     ) -> None:
         super().__init__(block_list)
-
-        # Instantiate scalar hyperparameters.
         self._beta2 = beta2
         self._epsilon = epsilon
         self._use_bias_correction = use_bias_correction
         self._bias_correction2: Tensor = torch.tensor(1.0)
 
-        # Instantiate (blocked) AdaGrad preconditioners and construct preconditioner list.
-        # NOTE: We need to instantiate the AdaGrad preconditioner states within the optimizer's state dictionary,
-        # and do not explicitly store them as AdagradPreconditionerList attributes here.
-        # This is because the optimizer state is defined per-parameter, but AdagradPreconditionerList is defined
-        # across each parameter group (which includes multiple parameters).
         preconditioner_list = []
         for block, block_info in zip(block_list, block_info_list, ):
             param_index, block_index = block_info.composable_block_ids
@@ -344,7 +253,6 @@ class AdagradPreconditionerList(PreconditionerList):
                 state[block_info.param][block_index] = {}
             block_state = state[block_info.param][block_index]
 
-            # Instantiate AdaGrad optimizer state for this block.
             preconditioner_index = str(param_index) + "." + str(block_index)
             block_state[ADAGRAD] = block_info.allocate_zeros_tensor(
                 block.size(), block.dtype, block.device
@@ -356,7 +264,6 @@ class AdagradPreconditionerList(PreconditionerList):
                 f"for Parameter {param_index} ({block_info.param.shape}), Block {block_index} ({block.shape})."
             )
 
-        # Masked lists are the list of active preconditioners or values after filtering out gradients with None.
         self._local_preconditioner_list: Tuple[Tensor, ...] = compress_list(
             preconditioner_list, distributor_selector
         )
@@ -364,7 +271,6 @@ class AdagradPreconditionerList(PreconditionerList):
             Tensor, ...
         ] = self._local_preconditioner_list
 
-        # Construct lists of bytes and numels for logging purposes.
         self._numel_list: Tuple[int, ...] = tuple(
             preconditioner.numel() for preconditioner in preconditioner_list
         )
@@ -373,7 +279,6 @@ class AdagradPreconditionerList(PreconditionerList):
             for preconditioner in preconditioner_list
         )
 
-        # Log breakdown of number of elements and bytes.
         logger.info(
             f"Rank {dist.get_rank()}: AdaGradPreconditionerList Numel Breakdown: {self._numel_list}"
         )
@@ -411,7 +316,6 @@ class AdagradPreconditionerList(PreconditionerList):
                     value=1 - self._beta2,
                 )
 
-            # Update bias correction term based on step list.
             if self._use_bias_correction and self._beta2 < 1.0:
                 self._bias_correction2 = torch.tensor(1.0) - self._beta2**step
 
@@ -463,38 +367,11 @@ class ShampooKroneckerFactors(OptimizerModule):
             torch.tensor(True) for _ in self.factor_matrices
         )
         self.eigenvalues = [None] * len(self.factor_matrices)
-        self.eigenvectors = [None] * len(self.factor_matrices)  
+        self.eigenvectors = [None] * len(self.factor_matrices)
 
 
 class ShampooPreconditionerList(PreconditionerList):
-    """Shampoo preconditioners for list of parameters.
-
-    NOTE: Does not support sparse gradients at this time.
-
-    Args:
-        block_list (Tuple[Tensor, ...]): List of (blocks of) parameters.
-        state (DefaultDict[Parameter, Any]): Dictionary containing optimizer state.
-        block_info_list (Tuple[BlockInfo, ...]): List containing corresponding BlockInfo for each block/parameter in block_list.
-            Note that this should have the same length as block_list.
-        distributor_selector (Tuple[bool, ...]): Distributor selector is a boolean list indicating whether a blocked parameter
-            is selected by the current Distributor.
-        beta2 (float): Exponential moving average factor for Shampoo factor matrices. If beta2 = 1., will use unweighted sum.
-            (Default: 1.0)
-        epsilon (float): Epsilon term for regularizing preconditioner to ensure positive definiteness. (Default: 1e-12)
-        inv_root_override (int, Tuple[int, ...]): Inverse root to use in Shampoo. If a list [l0, l1, l2, ..., lp], then we will
-            use -1 / l0 for 0-D tensors (scalars), -1 / l1 for 1-D tensor (vectors), -1 / l2 for 2-D tensors (matrices), and so on.
-            If the order of the tensor exceeds the length of the list, we revert to using the default value. If 0 is used, uses the
-            default inverse root -1 / (2 * o), where o is the order of the tensor. (Default: 0)
-        exponent_multiplier (float): Number to be multiplied to the numerator of the inverse root, i.e., eta where the
-            exponent is -eta / (2 * p). (Default: 1.0)
-        use_bias_correction (bool): Flag for using bias correction. (Default: True)
-        factor_matrix_dtype (torch.dtype): Data type for accumulating and computing root inverse of preconditioners. (Default: torch.float)
-        use_protected_eigh (bool): Flag for using two guards to prevent failures of torch.linalg.eigh. (Default: True)
-            1. Attempts to compute root inverse in preconditioner_dtype precision.
-            2. Attempts to recompute the eigendecomposition if using lower-precision fails.
-            3. Otherwise, re-uses previous inverse factor matrix when both root inverse computations fail.
-
-    """
+    """Shampoo preconditioners for list of parameters."""
 
     def __init__(
         self,
@@ -508,7 +385,7 @@ class ShampooPreconditionerList(PreconditionerList):
         epsilon_right : Optional[float] = None,
         use_adaptive_epsilon: bool = False,
         condition_thresholds: Optional[Dict[float, float]] = None,
-        is_default_config: bool = False,  # Optimization flag
+        is_default_config: bool = False,
         inv_root_override: Union[int, Tuple[int, ...]] = 0,
         exponent_multiplier: float = 1.0,
         use_bias_correction: bool = True,
@@ -519,7 +396,6 @@ class ShampooPreconditionerList(PreconditionerList):
     ) -> None:
         super().__init__(block_list)
 
-        # Initialize parameters.
         self._beta2 = beta2
         self._epsilon = epsilon
         self._use_trace_correction = use_trace_correction
@@ -531,15 +407,12 @@ class ShampooPreconditionerList(PreconditionerList):
         )
         self._matrix_root_inv_threshold = matrix_root_inv_threshold
         
-        # Optimization: Fast path detection
         self._is_default_config = is_default_config
         
-        # For adaptive epsilon (unchanged)
         self._thresholds_tensor = None
         self._epsilons_tensor = None
         self._small_positive_tensor = None
         
-        # Optimized: Determine configuration type
         self._use_per_dim_epsilon = False
         self._is_asymmetric_non_adaptive = False
         
@@ -557,11 +430,9 @@ class ShampooPreconditionerList(PreconditionerList):
         self._use_protected_eigh = use_protected_eigh
         self._bias_correction2: Tensor = torch.tensor(1.0)
         
-        # Instantiate (blocked) Kronecker factors and construct list of Kronecker factors.
         kronecker_factors_list = []
         epsilon_per_dim_list = [] if self._use_per_dim_epsilon else None
     
-        # Pre-compute epsilon tensors for asymmetric non-adaptive case
         if self._is_asymmetric_non_adaptive and len(block_list) > 0:
             device = block_list[0].device
             self._epsilon_left_tensor = torch.tensor(self._epsilon_left, device=device, dtype=torch.float32)
@@ -575,7 +446,6 @@ class ShampooPreconditionerList(PreconditionerList):
                 state[block_info.param][block_index] = {}
             block_state = state[block_info.param][block_index]
 
-            # Only compute per-dim epsilon if needed
             if self._use_per_dim_epsilon:
                 block_epsilon_per_dim = []
                 for dim_idx, dim in enumerate(dims):
@@ -587,8 +457,6 @@ class ShampooPreconditionerList(PreconditionerList):
                         block_epsilon_per_dim.append(self._epsilon_right)
                 epsilon_per_dim_list.append(tuple(block_epsilon_per_dim))
 
-            # Instantiate ShampooKroneckerFactors for this block.
-            # The factor matrices are instantiated using the determined dtype.
             factor_matrices = tuple(
                 block_info.allocate_zeros_tensor(
                     (dim, dim),
@@ -597,7 +465,6 @@ class ShampooPreconditionerList(PreconditionerList):
                 )
                 for dim in dims
             )
-            # The inverse factor matrices are instantiated using the dtype of the block / gradient.
             inv_factor_matrices = tuple(
                 block_info.allocate_zeros_tensor(
                     (dim, dim),
@@ -628,7 +495,6 @@ class ShampooPreconditionerList(PreconditionerList):
                 )
             )
 
-            # Optimized logging
             if self._is_default_config:
                 logger.info(
                     f"Instantiated Shampoo Preconditioner {preconditioner_index} "
@@ -651,13 +517,11 @@ class ShampooPreconditionerList(PreconditionerList):
                     f"for Parameter {param_index} ({block_info.param.shape}), Block {block_index} ({block.shape})."
                 )
 
-        # Initialize local lists.
         local_block_list = compress_list(block_list, distributor_selector)
         self._local_kronecker_factors_list: Tuple[
             ShampooKroneckerFactors, ...
         ] = compress_list(kronecker_factors_list, distributor_selector)
         
-        # Only create epsilon list if needed
         if self._use_per_dim_epsilon:
             self._local_epsilon_per_dim_list: Tuple[Tuple[float, ...], ...] = compress_list(
                 epsilon_per_dim_list, distributor_selector
@@ -672,7 +536,6 @@ class ShampooPreconditionerList(PreconditionerList):
             self._inv_root_override, self._local_order_list
         )
 
-        # Masked lists are the list of active preconditioners or values after filtering out gradients with None.
         self._masked_order_list: Tuple[int, ...] = self._local_order_list
         self._masked_root_list: Tuple[int, ...] = self._local_root_list
         self._masked_kronecker_factors_list: Tuple[
@@ -682,8 +545,6 @@ class ShampooPreconditionerList(PreconditionerList):
             self._local_epsilon_per_dim_list if self._use_per_dim_epsilon else None
         )
         
-        # Construct lists of bytes and numels for logging purposes.
-        # NOTE: These lists are constructed across all blocked parameters.
         self._numel_list: Tuple[int, ...] = tuple(
             sum(2 * dim**2 for dim in dims) for dims in self._dims_list
         )
@@ -694,7 +555,6 @@ class ShampooPreconditionerList(PreconditionerList):
             for numel, block in zip(self._numel_list, local_block_list)
         )
 
-        # Log breakdown of number of elements and bytes.
         logger.info(
             f"Rank {dist.get_rank()}: ShampooPreconditionerList Numel Breakdown: {self._numel_list}"
         )
@@ -715,16 +575,26 @@ class ShampooPreconditionerList(PreconditionerList):
             prev_eigenvalues : Tensor,
             epsilon : float
         ) -> Tensor:
+            # L_tilde = Q^T * L_t * Q (Whitened Perturbation Matrix)
             L_tilde = torch.linalg.multi_dot([prev_eigenvectors.T, factor_matrix, prev_eigenvectors])
+            
+            # d_term = sqrt(d + epsilon)
             d_term = torch.sqrt(prev_eigenvalues + epsilon)
+            
+            # Denominator matrix D_ij = sqrt(d_i + eps) * sqrt(d_j + eps)
             denominator = torch.outer(d_term, d_term)
+            
+            # Numerator E_ij = L_tilde_ij - delta_ij * d_i
             numerator = L_tilde - torch.diag(prev_eigenvalues)
+            
+            # Whitened Perturbation Matrix E
             scaled_diff = numerator / denominator
+            
+            # RC_t = ||E||_F
             rc_t = torch.linalg.norm(scaled_diff, ord = 'fro')
             return rc_t
         
     def _initialize_adaptive_epsilon_tensors(self) -> None:
-        """Initialize GPU tensors for adaptive epsilon computation once."""
         if not self._condition_thresholds or self._thresholds_tensor is not None:
             return
             
@@ -752,24 +622,6 @@ class ShampooPreconditionerList(PreconditionerList):
     def _get_inverse_roots_from_override(
         inv_root_override: Union[int, Sequence[int]], order_list: Tuple[int, ...]
     ) -> Tuple[int, ...]:
-        """Retrieves the appropriate root from the inverse root override parameter
-        for a list of tensor orders.
-
-        For example, suppose inv_root_override = (2, 1, 4, 3).
-        If order = 0, then we will return 2;
-        If order = 1, then we will return 1;
-        If order = 2, then we will return 4;
-        If order = 3, then we will return 3;
-        If order > 3, then we will return 2 * order.
-
-        Args:
-            inv_root_override (int, Sequence[int]): Inverse root override int or list.
-            order_list (Tuple[int, ...]): List of orders for their corresponding tensors.
-
-        Returns:
-            root_list (int): Inverse roots to use in Shampoo for a list of tensors.
-
-        """
         if isinstance(inv_root_override, Sequence):
             return tuple(
                 2 * order
@@ -790,37 +642,29 @@ class ShampooPreconditionerList(PreconditionerList):
         with profiler.record_function(
             f"## {self.__class__.__name__}:{self.update_preconditioners.__name__} ##"
         ):
-            # NOTE: Unlike AdagradPreconditionerList, we will loop through each gradient individually.
-            # We apply foreach operators onto the list of Kronecker factor matrices (as opposed to the
-            # full list of gradients/optimizer states).
             for grad, order, kronecker_factors in zip(
                 masked_grad_list,
                 self._masked_order_list,
                 self._masked_kronecker_factors_list,
             ):
-                # Scale Kronecker factors as a list.
                 if self._beta2 != 1.0:
                     torch._foreach_mul_(kronecker_factors.factor_matrices, self._beta2)
 
-                # Construct outer product list for updating Kronecker factors.
                 outer_product_list = tuple(
                     torch.tensordot(
                         grad,
                         grad,
-                        # Contracts across all dimensions except for k.
                         dims=[[*chain(range(k), range(k + 1, order))]] * 2,
                     )
                     for k in range(order)
                 )
 
-                # Update Kronecker factors.
                 torch._foreach_add_(
                     kronecker_factors.factor_matrices,
                     outer_product_list,
                     alpha=1 - self._beta2 if self._beta2 != 1.0 else 1.0,
                 )
 
-            # Update bias correction term based on step list.
             if self._use_bias_correction and self._beta2 < 1.0:
                 self._bias_correction2 = torch.tensor(1.0) - self._beta2**step
 
@@ -873,42 +717,73 @@ class ShampooPreconditionerList(PreconditionerList):
         factor_idx : int
     ) -> None:
         """Compute root inverse for a single factor matrix."""
-        # For tracking diagonality of the preconditioner.
-        # Checks if the preconditioner is currently diagonal, then checks whether or not
-        # the update matrix is diagonal.
         if is_factor_matrix_diagonal and not check_diagonal(factor_matrix):
             is_factor_matrix_diagonal.copy_(torch.tensor(False))
             logger.debug(
                 f"Factor matrix {factor_matrix_index} is not diagonal."
             )
 
-        # Add epsilon term and incorporate bias correction.
         bias_corrected_factor_matrix = (
             factor_matrix / self._bias_correction2
         )
+        
         should_update = True
         if (self._matrix_root_inv_threshold > 0.0 and
         kronecker_factors.eigenvectors[factor_idx] is not None):
             try:
+                # 1. Calculate standard RC_t
                 rc_t = self._compute_relative_condition_number(
                     bias_corrected_factor_matrix,
                     kronecker_factors.eigenvectors[factor_idx],
                     kronecker_factors.eigenvalues[factor_idx],
                     epsilon_value
                 )
-                if rc_t < self._matrix_root_inv_threshold:
+                
+                # 2. Calculate Ratio Factor (alpha) for Tighter Bound
+                # alpha = Spectral Norm / Frobenius Norm <= 1
+                # Spectral Norm of A^{-1/p} = min(evals + eps)^(-1/p)
+                # Frobenius Norm of A^{-1/p} = sqrt(sum((evals + eps)^(-2/p)))
+                
+                prev_evals = kronecker_factors.eigenvalues[factor_idx]
+                
+                # Effective inverse exponent: - (exponent_multiplier / root)
+                # Note: Shampoo's exponent_multiplier usually defaults to 1.0
+                inv_exponent = self._exponent_multiplier / root
+                
+                # Ensure eigenvalues are safe (positive)
+                evals_safe = torch.clamp(prev_evals + epsilon_value, min=1e-16)
+                
+                # Calculate norms of the INVERSE matrix (A^{-1/p})
+                # Spectral Norm = max eigenvalue of A^{-1/p} = (min eigenvalue of A)^(-1/p)
+                min_eval = torch.min(evals_safe)
+                spectral_norm = torch.pow(min_eval, -inv_exponent)
+                
+                # Frobenius Norm
+                frob_norm = torch.norm(torch.pow(evals_safe, -inv_exponent))
+                
+                ratio_factor = spectral_norm / frob_norm
+                
+                # 3. Check condition: RC_t * alpha >= threshold?
+                # Equivalent to: RC_t >= threshold / alpha (since alpha <= 1, threshold increases)
+                # This effectively relaxes the condition, allowing more skips.
+                
+                adjusted_metric = rc_t * ratio_factor
+                
+                if adjusted_metric < self._matrix_root_inv_threshold:
                     should_update = False
                     if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(f"Skpping update for {factor_matrix_index} : RC_t {rc_t:.4e} < {self._matrix_root_inv_threshold:.4e}")
+                        logger.debug(f"Skipping update for {factor_matrix_index} : Adjusted Metric {adjusted_metric:.4e} < {self._matrix_root_inv_threshold:.4e} (RC_t: {rc_t:.4e}, Ratio: {ratio_factor:.4f})")
                 else:
                     if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(f"Updating {factor_matrix_index} : RC_t {rc_t:.4e} > {self._matrix_root_inv_threshold:.4e} ")
+                        logger.debug(f"Updating {factor_matrix_index} : Adjusted Metric {adjusted_metric:.4e} >= {self._matrix_root_inv_threshold:.4e} (RC_t: {rc_t:.4e}, Ratio: {ratio_factor:.4f})")
+                        
             except Exception as e:
                 logger.warning(f"Failed to computed RC_t for {factor_matrix_index}, forcing update. Error:{e}")
                 should_update = True
+        
         if not should_update:
             return
-        # Check for nan or inf values.
+
         if torch.isnan(bias_corrected_factor_matrix).any():
             raise ValueError(
                 f"Encountered nan values in bias-corrected factor matrix {factor_matrix_index}! "
@@ -928,9 +803,6 @@ class ShampooPreconditionerList(PreconditionerList):
                 f"{factor_matrix.isinf().any()=}, {factor_matrix.isnan().any()=}."
             )
 
-        # Compute inverse preconditioner.
-        # If reuse_previous_inv_factor_matrix is True, will reuse previous matrix if matrix
-        # inverse root computation fails.
         try:
             result = matrix_inverse_root(
                 A=bias_corrected_factor_matrix,
@@ -954,8 +826,6 @@ class ShampooPreconditionerList(PreconditionerList):
                 kronecker_factors.eigenvalues[factor_idx] = L.to(dtype = factor_matrix.dtype)
                 kronecker_factors.eigenvectors[factor_idx] = Q.to(dtype = factor_matrix.dtype)
             
-            
-
             if self._use_adaptive_epsilon and logger.isEnabledFor(logging.DEBUG):
                 if isinstance(used_epsilon_tensor, torch.Tensor):
                     if abs(float(used_epsilon_tensor) - epsilon_value) > 1e-12:
@@ -965,7 +835,6 @@ class ShampooPreconditionerList(PreconditionerList):
                             f"Adjusted epsilon = {float(used_epsilon_tensor):.2e}"
                         )
             
-            # Check if we encounter NaN or inf values in computed inverse matrix.
             if (
                 torch.isnan(computed_inv_factor_matrix).any()
                 or torch.isinf(computed_inv_factor_matrix).any()
@@ -993,62 +862,40 @@ class ShampooPreconditionerList(PreconditionerList):
                 )
 
     def compute_root_inverse(self) -> None:
-        # NOTE: This function currently only computes the matrix root inverse based on
-        # the masked lists which combines both selection based on the distributor and where
-        # grad is not None. Implicitly, this assumes that there are no changes between the
-        # selector or masking from iteration-to-iteration within a single precondition_frequency
-        # interval.
         with profiler.record_function(
             f"## {self.__class__.__name__}:{self.compute_root_inverse.__name__} ##"
         ):
-            # Lazy initialization of adaptive epsilon tensors
             if self._use_adaptive_epsilon and self._thresholds_tensor is None:
                 self._initialize_adaptive_epsilon_tensors()
             
-            # Optimized: Fast path for default configuration
             if self._is_default_config:
                 for kronecker_factors, root in zip(
                     self._local_kronecker_factors_list,
                     self._local_root_list,
                 ):
-                    for (
+                    for idx, (
                         factor_matrix,
                         inv_factor_matrix,
                         is_factor_matrix_diagonal,
                         factor_matrix_index,
-                    ) in zip(
+                    ) in enumerate(zip(
                         kronecker_factors.factor_matrices,
                         kronecker_factors.inv_factor_matrices,
                         kronecker_factors.is_factor_matrices_diagonal,
                         kronecker_factors.factor_matrix_indices,
-                    ):
-                        # Direct call with single epsilon
-                        if is_factor_matrix_diagonal and not check_diagonal(factor_matrix):
-                            is_factor_matrix_diagonal.copy_(torch.tensor(False))
-                        
-                        bias_corrected_factor_matrix = factor_matrix / self._bias_correction2
-                        
-                        # Fast path for default config
-                        try:
-                            computed_inv_factor_matrix = matrix_inverse_root_fast_default(
-                                A=bias_corrected_factor_matrix,
-                                root=root,
-                                epsilon=self._epsilon,
-                                exponent_multiplier=self._exponent_multiplier,
-                                is_diagonal=is_factor_matrix_diagonal,
-                                retry_double_precision=self._use_protected_eigh,
-                            ).to(dtype=inv_factor_matrix.dtype)
-                            
-                            inv_factor_matrix.copy_(computed_inv_factor_matrix)
-                        except Exception as exception:
-                            if not self._use_protected_eigh:
-                                raise exception
-                            else:
-                                logger.warning(
-                                    f"Matrix inverse root computation failed for {factor_matrix_index}: {exception}"
-                                )
+                    )):
+                        # Call single root inverse to enable conditional check (even for default config)
+                        self._compute_single_root_inverse(
+                            factor_matrix,
+                            inv_factor_matrix,
+                            is_factor_matrix_diagonal,
+                            factor_matrix_index,
+                            kronecker_factors = kronecker_factors,
+                            factor_idx = idx,
+                            root = root,
+                            epsilon_value = self._epsilon,
+                        )
                                 
-            # Optimized: Fast path for asymmetric non-adaptive configuration            
             elif self._is_asymmetric_non_adaptive:
                 for kronecker_factors, root, epsilon_per_dim in zip(
                     self._local_kronecker_factors_list,
@@ -1068,32 +915,18 @@ class ShampooPreconditionerList(PreconditionerList):
                         kronecker_factors.factor_matrix_indices,
                         epsilon_per_dim,
                     )):
-                        if is_factor_matrix_diagonal and not check_diagonal(factor_matrix):
-                            is_factor_matrix_diagonal.copy_(torch.tensor(False))
-                        
-                        bias_corrected_factor_matrix = factor_matrix / self._bias_correction2
-                        
-                        # Fast path for asymmetric non-adaptive
-                        try:
-                            computed_inv_factor_matrix = matrix_inverse_root_fast_asymmetric(
-                                A=bias_corrected_factor_matrix,
-                                root=root,
-                                epsilon=epsilon_for_this_dim,
-                                exponent_multiplier=self._exponent_multiplier,
-                                is_diagonal=is_factor_matrix_diagonal,
-                                retry_double_precision=self._use_protected_eigh,
-                            ).to(dtype=inv_factor_matrix.dtype)
-                            
-                            inv_factor_matrix.copy_(computed_inv_factor_matrix)
-                        except Exception as exception:
-                            if not self._use_protected_eigh:
-                                raise exception
-                            else:
-                                logger.warning(
-                                    f"Matrix inverse root computation failed for {factor_matrix_index}: {exception}"
-                                )
+                        # Call single root inverse to enable conditional check
+                        self._compute_single_root_inverse(
+                            factor_matrix,
+                            inv_factor_matrix,
+                            is_factor_matrix_diagonal,
+                            factor_matrix_index,
+                            kronecker_factors = kronecker_factors,
+                            factor_idx = idx,
+                            root = root,
+                            epsilon_value = epsilon_for_this_dim,
+                        )
                                 
-            # Original path for adaptive epsilon (unchanged)
             elif self._use_per_dim_epsilon:
                 for kronecker_factors, root, epsilon_per_dim in zip(
                     self._local_kronecker_factors_list,
@@ -1108,6 +941,7 @@ class ShampooPreconditionerList(PreconditionerList):
                         factor_matrix_index,
                         epsilon_for_this_dim,
                     ) in zip(
+                        range(len(kronecker_factors.factor_matrices)),
                         kronecker_factors.factor_matrices,
                         kronecker_factors.inv_factor_matrices,
                         kronecker_factors.is_factor_matrices_diagonal,
@@ -1122,7 +956,7 @@ class ShampooPreconditionerList(PreconditionerList):
                             kronecker_factors = kronecker_factors,
                             factor_idx = i,
                             root = root,
-                            epsilon_for_this_dim = epsilon_for_this_dim,
+                            epsilon_value = epsilon_for_this_dim,
                         )
             else:
                 for kronecker_factors, root in zip(

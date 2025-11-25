@@ -390,7 +390,7 @@ if __name__ == "__main__":
     parser.add_argument('--encoder-dim', type=int, default=512)
     parser.add_argument('--num-layers', type=int, default=4, help="AlgoPerf uses 4 layers") 
     parser.add_argument('--num-heads', type=int, default=8)
-    parser.add_argument('--depthwise-kernel-size', type=int, default=31)
+    parser.add_argument('--depthwise-kernel-size', type=int, default=32)
     
     # Training Params
     parser.add_argument('--epochs', type=int, default=90)

@@ -18,6 +18,10 @@ from dataclasses import dataclass
 from collections import defaultdict
 from typing import Dict, List, Optional
 from torch.utils.tensorboard import SummaryWriter
+import functools
+
+# Hugging Face datasets 라이브러리 추가
+from datasets import load_dataset
 
 # Shampoo imports
 from optimizers.distributed_shampoo.distributed_shampoo import DistributedShampoo
@@ -273,43 +277,70 @@ def create_algoperf_resnet50(virtual_batch_size=64):
 # ==========================================
 # 4. Dataset & Loader
 # ==========================================
+
+# vit.py 스타일의 transform 적용 함수
+def apply_transforms(examples, transform):
+    examples['pixel_values'] = [transform(image.convert("RGB")) for image in examples['image']]
+    return examples
+
 def get_dataloaders(data_path, batch_size, workers, world_size, global_rank):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    # Train Data
-    traindir = os.path.join(data_path, 'train')
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
+    # ResNet용 Transform 정의 (Torchvision 사용 유지)
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    # Hugging Face 데이터셋 로드 (vit.py 로직 적용)
+    if global_rank == 0:
+        print("Hugging Face Hub에서 ImageNet-1k 데이터셋을 다운로드 및 캐싱합니다...")
+        # 메인 프로세스에서 먼저 다운로드/캐싱 수행
+        load_dataset("imagenet-1k", cache_dir=data_path)
+    dist.barrier() # 다른 프로세스들은 대기
+
+    print(f"Rank {global_rank}에서 캐시된 ImageNet-1k 데이터셋을 로딩합니다...")
+    dataset = load_dataset("imagenet-1k", cache_dir=data_path)
+
+    # Train Data 설정
+    train_dataset = dataset['train']
+    train_dataset.set_transform(functools.partial(apply_transforms, transform=train_transform))
+    
+    # Val Data 설정
+    val_dataset = dataset['validation']
+    val_dataset.set_transform(functools.partial(apply_transforms, transform=val_transform))
+
+    # Collate Function 정의
+    def collate_fn(batch):
+        return {
+            'pixel_values': torch.stack([x['pixel_values'] for x in batch]),
+            'label': torch.tensor([x['label'] for x in batch], dtype=torch.long)
+        }
+
+    # DataLoader 생성
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank)
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=workers, pin_memory=True, sampler=train_sampler
+        num_workers=workers, pin_memory=True, sampler=train_sampler,
+        collate_fn=collate_fn
     )
     
-    # Val Data (if available)
-    valdir = os.path.join(data_path, 'val')
-    val_loader = None
-    if os.path.exists(valdir):
-        val_dataset = datasets.ImageFolder(
-            valdir,
-            transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                normalize,
-            ]))
-        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False)
-        val_loader = DataLoader(
-            val_dataset, batch_size=batch_size, shuffle=False,
-            num_workers=workers, pin_memory=True, sampler=val_sampler
-        )
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False)
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=workers, pin_memory=True, sampler=val_sampler,
+        collate_fn=collate_fn
+    )
     
     return train_loader, val_loader
 
@@ -400,11 +431,11 @@ def main(args):
         
         batch_start = time.perf_counter()
         
-        for i, (images, target) in enumerate(train_loader):
+        for i, batch in enumerate(train_loader):
             wall_clock_profiler.timers["data_loading"].update(time.perf_counter() - batch_start)
             
-            images = images.to(local_rank, non_blocking=True)
-            target = target.to(local_rank, non_blocking=True)
+            images = batch['pixel_values'].to(local_rank, non_blocking=True)
+            target = batch['label'].to(local_rank, non_blocking=True)
 
             wall_clock_profiler.start_timer("forward")
             optimizer.zero_grad()
@@ -440,9 +471,10 @@ def main(args):
             correct = 0
             total = 0
             with torch.no_grad():
-                for images, target in val_loader:
-                    images = images.to(local_rank, non_blocking=True)
-                    target = target.to(local_rank, non_blocking=True)
+                for batch in val_loader:
+                    images = batch['pixel_values'].to(local_rank, non_blocking=True)
+                    target = batch['label'].to(local_rank, non_blocking=True)
+                    
                     output = model(images)
                     _, predicted = output.max(1)
                     total += target.size(0)

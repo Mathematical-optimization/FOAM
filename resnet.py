@@ -5,32 +5,35 @@ import torch.optim as optim
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import argparse
+import math
 from typing import Type, Any, Callable, Union, List, Optional
 
-# ==========================================
-# 1. Configuration
-# ==========================================
-class Config:
-    # Path to your ImageNet dataset
-    # 이 경로에 'train'과 'val' 폴더가 있어야 합니다.
-    data_path = "/path/to/imagenet_root" 
-    
-    # Training Params
-    batch_size = 64         # 메모리 상황에 맞춰 조정 (논문은 대형 배치 사용)
-    learning_rate = 1e-3    # 논문 베이스라인 설정 (AdamW 등)
-    epochs = 90             # 일반적인 ImageNet 학습 Epoch
-    num_classes = 1000      # ImageNet 클래스 개수
-    
-    # AlgoPerf Specifics
-    virtual_batch_size = 64 # Ghost BN용 가상 배치 사이즈
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_workers = 8         # 데이터 로딩 속도를 위해 높게 설정
-
-print(f"Using device: {Config.device}")
+# Shampoo imports
+from optimizers.distributed_shampoo.distributed_shampoo import DistributedShampoo
+from optimizers.distributed_shampoo.shampoo_types import (
+    AdamGraftingConfig,
+    DDPShampooConfig,
+    CommunicationDType
+)
 
 # ==========================================
-# 2. Ghost Batch Normalization [cite: 1833-1837]
+# 1. Setup & Utility
+# ==========================================
+def setup():
+    dist.init_process_group(backend="nccl", init_method="env://")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+def cleanup():
+    dist.destroy_process_group()
+
+# ==========================================
+# 2. Ghost Batch Normalization
 # ==========================================
 class GhostBatchNorm2d(nn.Module):
     def __init__(self, num_features, virtual_batch_size=64, momentum=0.1, eps=1e-5):
@@ -48,7 +51,7 @@ class GhostBatchNorm2d(nn.Module):
         return torch.cat(res, dim=0)
 
 # ==========================================
-# 3. ResNet Model Architecture [cite: 1833]
+# 3. ResNet Model Architecture
 # ==========================================
 class Bottleneck(nn.Module):
     expansion: int = 4
@@ -84,7 +87,7 @@ class Bottleneck(nn.Module):
         return out
 
 class ResNet(nn.Module):
-    def __init__(self, block, layers, num_classes=1000, zero_init_residual=False, norm_layer=None):
+    def __init__(self, block, layers, num_classes=1000, zero_init_residual=False, norm_layer=None, virtual_batch_size=64):
         super(ResNet, self).__init__()
         if norm_layer is None: norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
@@ -110,7 +113,6 @@ class ResNet(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-        # AlgoPerf Requirement: Zero-initialize the last BN in each residual block [cite: 1837]
         if zero_init_residual:
             for m in self.modules():
                 if isinstance(m, Bottleneck) and m.bn3.weight is not None:
@@ -145,29 +147,25 @@ class ResNet(nn.Module):
         x = self.fc(x)
         return x
 
-def create_algoperf_resnet50():
+def create_algoperf_resnet50(virtual_batch_size=64):
     norm_layer = lambda num_features: GhostBatchNorm2d(
-        num_features, virtual_batch_size=Config.virtual_batch_size
+        num_features, virtual_batch_size=virtual_batch_size
     )
     return ResNet(
         block=Bottleneck,
         layers=[3, 4, 6, 3],
-        num_classes=Config.num_classes,
-        zero_init_residual=True, # AlgoPerf 필수 사항
-        norm_layer=norm_layer    # AlgoPerf 필수 사항
+        num_classes=1000,
+        zero_init_residual=True,
+        norm_layer=norm_layer,
+        virtual_batch_size=virtual_batch_size
     )
 
 # ==========================================
-# 4. ImageNet Dataset Loading [cite: 1827-1829]
+# 4. Dataset & Loader
 # ==========================================
-def get_dataloaders():
-    traindir = os.path.join(Config.data_path, 'train')
-    valdir = os.path.join(Config.data_path, 'val')
+def get_dataloaders(data_path, batch_size, workers, world_size, global_rank):
+    traindir = os.path.join(data_path, 'train')
     
-    # AlgoPerf Paper: "random crop and randomly flip the image" [cite: 1828]
-    # 논문은 normalized to [0,1]이라고 명시했지만[cite: 1829],
-    # ResNet 학습 안정성을 위해 통상적인 ImageNet mean/std 정규화를 포함하는 것이 일반적입니다.
-    # 만약 논문의 [0,1]을 엄격히 따르려면 Normalize를 제외하면 됩니다.
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
@@ -180,53 +178,64 @@ def get_dataloaders():
             normalize,
         ]))
 
-    val_dataset = datasets.ImageFolder(
-        valdir,
-        transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ]))
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank)
 
     train_loader = DataLoader(
-        train_dataset, batch_size=Config.batch_size, shuffle=True,
-        num_workers=Config.num_workers, pin_memory=True
-    )
-
-    val_loader = DataLoader(
-        val_dataset, batch_size=Config.batch_size, shuffle=False,
-        num_workers=Config.num_workers, pin_memory=True
+        train_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=workers, pin_memory=True, sampler=train_sampler
     )
     
-    return train_loader, val_loader
+    return train_loader
 
 # ==========================================
-# 5. Training Loop
+# 5. Main
 # ==========================================
-def train():
-    if not os.path.exists(Config.data_path):
-        print(f"Error: Data path '{Config.data_path}' does not exist.")
-        print("Please download ImageNet and set 'Config.data_path' correctly.")
-        return
-
-    train_loader, val_loader = get_dataloaders()
-    model = create_algoperf_resnet50().to(Config.device)
+def main(args):
+    local_rank = setup()
+    global_rank = dist.get_rank()
+    world_size = dist.get_world_size()
     
-    # Optimizer (AlgoPerf baselines use AdamW, NadamW, etc.)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=Config.learning_rate)
-    
-    print(f"Model created. Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    print("Start Training on ImageNet...")
+    if global_rank == 0:
+        print(f"Starting ResNet-50 training with Distributed Shampoo")
+        print(f"World Size: {world_size}, Batch Size per GPU: {args.batch_size}")
 
-    for epoch in range(Config.epochs):
+    # Create Model
+    model = create_algoperf_resnet50(virtual_batch_size=args.batch_size).to(local_rank)
+    model = DDP(model, device_ids=[local_rank])
+    
+    # Distributed Shampoo Optimizer
+    distributed_config = DDPShampooConfig(
+        communication_dtype=CommunicationDType.FP32,
+        num_trainers_per_group=world_size,
+        communicate_params=False
+    )
+
+    optimizer = DistributedShampoo(
+        model.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        epsilon=1e-8,
+        weight_decay=args.weight_decay,
+        max_preconditioner_dim=args.max_preconditioner_dim,
+        precondition_frequency=args.precondition_frequency,
+        start_preconditioning_step=args.start_preconditioning_step,
+        use_decoupled_weight_decay=True,
+        grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-8),
+        distributed_config=distributed_config,
+        use_protected_eigh=True
+    )
+
+    criterion = nn.CrossEntropyLoss().to(local_rank)
+    train_loader = get_dataloaders(args.data_path, args.batch_size, args.workers, world_size, global_rank)
+
+    for epoch in range(args.epochs):
+        train_loader.sampler.set_epoch(epoch)
         model.train()
         running_loss = 0.0
         
         for i, (images, target) in enumerate(train_loader):
-            images = images.to(Config.device, non_blocking=True)
-            target = target.to(Config.device, non_blocking=True)
+            images = images.to(local_rank, non_blocking=True)
+            target = target.to(local_rank, non_blocking=True)
 
             optimizer.zero_grad()
             output = model(images)
@@ -236,14 +245,27 @@ def train():
 
             running_loss += loss.item()
             
-            if i % 100 == 99:
-                print(f"Epoch [{epoch+1}/{Config.epochs}] Batch [{i+1}] Loss: {running_loss/100:.4f}")
-                running_loss = 0.0
-                
-        # Validation (Optional per epoch)
-        # validate(val_loader, model, criterion)
+            if i % args.log_interval == 0 and global_rank == 0:
+                print(f"Epoch [{epoch+1}/{args.epochs}] Batch [{i}] Loss: {loss.item():.4f}")
 
-    print("Training Finished.")
+    cleanup()
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description='ResNet50 ImageNet Training with Shampoo')
+    parser.add_argument('--data-path', type=str, required=True, help='Path to ImageNet dataset')
+    parser.add_argument('--epochs', type=int, default=90, help='Number of epochs')
+    parser.add_argument('--batch-size', type=int, default=64, help='Batch size per GPU')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
+    parser.add_argument('--workers', type=int, default=4, help='Number of workers')
+    
+    # Shampoo Params
+    parser.add_argument('--beta1', type=float, default=0.9)
+    parser.add_argument('--beta2', type=float, default=0.999)
+    parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
+    parser.add_argument('--precondition-frequency', type=int, default=100)
+    parser.add_argument('--start-preconditioning-step', type=int, default=100)
+    parser.add_argument('--log-interval', type=int, default=100)
+
+    args = parser.parse_args()
+    main(args)

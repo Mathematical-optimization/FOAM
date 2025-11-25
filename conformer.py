@@ -14,7 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn import functional as F
 import torchaudio
 import logging
-
+from torch.utils.data import ConcatDataset 
 # Shampoo Optimizer Imports
 from optimizers.distributed_shampoo.distributed_shampoo import DistributedShampoo
 from optimizers.distributed_shampoo.shampoo_types import (
@@ -110,6 +110,14 @@ class AlgoPerfLibriSpeech(Dataset):
         )
         self.train = train
         self.args = args
+        
+        if self.train:
+            ds1 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-clean-100", download=download)
+            ds2 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-clean-360", download=download)
+            ds3 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-other-500", download=download)
+            self.dataset = ConcatDataset([ds1, ds2, ds3])
+        else:
+            self.dataset = torchaudio.datasets.LIBRISPEECH(root=root, url=url, download=download)
         
         self.melspec = torchaudio.transforms.MelSpectrogram(
             sample_rate=args.sample_rate,
@@ -221,7 +229,10 @@ def main(args):
         if not os.path.exists(args.data_path):
             os.makedirs(args.data_path)
         # 다운로드 (메인 프로세스만)
+        print("Downloading Librispeech datasets...")
         torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-clean-100", download=True)
+        torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-clean-360", download=True)
+        torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-other-500", download=True)  
     dist.barrier()
 
     train_dataset = AlgoPerfLibriSpeech(
@@ -379,12 +390,12 @@ if __name__ == "__main__":
     parser.add_argument('--depthwise-kernel-size', type=int, default=31)
     
     # Training Params
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch-size', type=int, default=64, help='Per-GPU batch size (adjusted for A6000)')
+    parser.add_argument('--epochs', type=int, default=90)
+    parser.add_argument('--batch-size', type=int, default=50, help='Per-GPU batch size (adjusted for A6000)')
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--lr', type=float, default=0.002)
-    parser.add_argument('--warmup-steps', type=int, default=10000)
+    parser.add_argument('--warmup-steps', type=int, default=569400)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--grad-clip', type=float, default=1.0)
     parser.add_argument('--beta1', type=float, default=0.9)

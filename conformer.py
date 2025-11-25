@@ -284,16 +284,19 @@ def main(args):
         lr=args.lr,
         betas=(args.beta1, args.beta2),
         weight_decay=args.weight_decay,
-        epsilon=1e-12,
+        epsilon=1e-10,
         momentum=0.0,
         max_preconditioner_dim=args.max_preconditioner_dim,
         precondition_frequency=args.precondition_frequency,
         start_preconditioning_step=args.start_preconditioning_step,
         grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-8),
         use_decoupled_weight_decay=True,
+        inv_root_override=2,
+        exponent_multiplier=1,
         distributed_config=distributed_config,
         preconditioner_dtype=torch.float32,
-        use_protected_eigh=True
+        use_protected_eigh=True,
+        matrix_root_inv_threshold=0.0,
     )
 
     criterion = nn.CTCLoss(blank=len(text_transform)-1).to(local_rank)

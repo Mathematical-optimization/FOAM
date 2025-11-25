@@ -1,42 +1,81 @@
 import os
+import math
+import argparse
+import time
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchaudio
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.nn import functional as F
+import torchaudio
+import logging
+
+# Shampoo Optimizer Imports
+from optimizers.distributed_shampoo.distributed_shampoo import DistributedShampoo
+from optimizers.distributed_shampoo.shampoo_types import (
+    AdamGraftingConfig,
+    DDPShampooConfig,
+    CommunicationDType
+)
 
 # ==========================================
-# 1. Configuration
+# 1. Utilities & Setup
 # ==========================================
-class Config:
-    # Audio Params [cite: 1887]
-    sample_rate = 16000
-    n_fft = 400       # 25ms
-    hop_length = 160  # 10ms
-    n_mels = 80       # Log-mel spectrogram features
-    
-    # Model Params [cite: 1891-1892]
-    encoder_dim = 512
-    num_layers = 4
-    num_heads = 8     # 512 dim / 64 per head = 8 heads (Typical default)
-    depthwise_conv_kernel_size = 31 # Conformer default
-    
-    # Training Params
-    batch_size = 8    # 메모리에 맞춰 조정
-    learning_rate = 1e-3 # 논문의 NadamW/AdamW 사용 시 적절히 조정
-    epochs = 1
-    max_audio_length = 320000 # [cite: 1887]
-    
-    # Path
-    data_path = "./data"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-print(f"Using device: {Config.device}")
+class EighFallbackCounter(logging.Handler):
+    """'eigh' 연산이 float64로 재시도될 때 발생하는 경고를 카운트합니다."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.count = 0
+        self.setLevel(logging.WARNING)
+
+    def emit(self, record):
+        try:
+            message = record.getMessage()
+            if "Retrying in double precision" in message:
+                self.count += 1
+        except Exception:
+            self.handleError(record)
+
+def set_seed_distributed(seed: int = 42, rank: int = 0):
+    rank_seed = seed + rank
+    random.seed(rank_seed)
+    np.random.seed(rank_seed)
+    torch.manual_seed(rank_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(rank_seed)
+        torch.cuda.manual_seed_all(rank_seed)
+    os.environ['PYTHONHASHSEED'] = str(rank_seed)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+
+def setup():
+    """분산 학습 초기화"""
+    dist.init_process_group(backend="nccl", init_method="env://")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+def cleanup():
+    dist.destroy_process_group()
+
+def get_lr_schedule(current_step, warmup_steps, base_lr, total_steps):
+    """Warmup + Cosine Decay Scheduler"""
+    if current_step < warmup_steps:
+        return base_lr * (current_step / max(1, warmup_steps))
+    else:
+        progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return base_lr * 0.5 * (1 + math.cos(math.pi * progress))
 
 # ==========================================
-# 2. Tokenizer (Simple Character-level)
+# 2. Tokenizer & Dataset
 # ==========================================
+
 class TextTransform:
     def __init__(self):
         self.char_map = {"'": 0, " ": 1}
@@ -59,33 +98,26 @@ class TextTransform:
         return "".join(string)
 
     def __len__(self):
-        return len(self.char_map) + 1 # +1 for CTC blank
+        return len(self.char_map) + 1 
 
-text_transform = TextTransform()
-
-# ==========================================
-# 3. Dataset & Preprocessing [cite: 1887-1889]
-# ==========================================
 class AlgoPerfLibriSpeech(Dataset):
-    def __init__(self, root, url="train-clean-100", download=True, train=True):
+    def __init__(self, root, url="train-clean-100", download=True, train=True, args=None):
         if not os.path.isdir(root):
-            os.makedirs(root)
+            os.makedirs(root, exist_ok=True)
         
-        # 실제 학습 시 train-clean-100, 360, other-500 조합 사용 [cite: 1881]
-        # 여기서는 데모를 위해 train-clean-100만 사용
         self.dataset = torchaudio.datasets.LIBRISPEECH(
             root=root, url=url, download=download
         )
         self.train = train
+        self.args = args
         
         self.melspec = torchaudio.transforms.MelSpectrogram(
-            sample_rate=Config.sample_rate,
-            n_fft=Config.n_fft,
-            hop_length=Config.hop_length,
-            n_mels=Config.n_mels
+            sample_rate=args.sample_rate,
+            n_fft=args.n_fft,
+            hop_length=args.hop_length,
+            n_mels=args.n_mels
         )
         
-        # SpecAugment is used in preprocessing pipeline
         self.spec_augment = nn.Sequential(
             torchaudio.transforms.TimeMasking(time_mask_param=35),
             torchaudio.transforms.FrequencyMasking(freq_mask_param=27)
@@ -97,11 +129,10 @@ class AlgoPerfLibriSpeech(Dataset):
     def __getitem__(self, idx):
         waveform, sample_rate, transcript, _, _, _ = self.dataset[idx]
         
-        # Filter length > 320k [cite: 1887]
-        if waveform.shape[1] > Config.max_audio_length:
+        # Filter long audio
+        if waveform.shape[1] > self.args.max_audio_length:
             return None
             
-        # Log-Mel Spectrogram [cite: 1887]
         spec = self.melspec(waveform)
         spec = torch.log(spec + 1e-9)
         
@@ -110,6 +141,9 @@ class AlgoPerfLibriSpeech(Dataset):
         
         # (Channel, n_mels, Time) -> (Time, n_mels)
         return spec.squeeze(0).transpose(0, 1), transcript
+
+# 전역 TextTransform 인스턴스 (worker_init_fn 문제 방지용)
+text_transform = TextTransform()
 
 def collate_fn(batch):
     batch = [item for item in batch if item is not None]
@@ -123,148 +157,250 @@ def collate_fn(batch):
 
     for spec, transcript in batch:
         spectrograms.append(spec)
-        
         label = text_transform.text_to_int(transcript)
         labels.append(label)
-        
-        input_lengths.append(spec.shape[0]) # Time dimension
+        input_lengths.append(spec.shape[0]) 
         label_lengths.append(len(label))
 
-    spectrograms = nn.utils.rnn.pad_sequence(spectrograms, batch_first=True) # (B, T, F)
+    spectrograms = nn.utils.rnn.pad_sequence(spectrograms, batch_first=True)
     labels = nn.utils.rnn.pad_sequence(labels, batch_first=True)
 
     return spectrograms, labels, torch.tensor(input_lengths), torch.tensor(label_lengths)
 
 # ==========================================
-# 4. Conformer Model [cite: 1891-1892]
+# 3. Model
 # ==========================================
+
 class ConformerAlgoPerf(nn.Module):
-    def __init__(self, num_classes, input_dim=80, encoder_dim=512, num_layers=4, num_heads=8):
+    def __init__(self, num_classes, input_dim=80, encoder_dim=512, num_layers=4, num_heads=8, depthwise_kernel_size=31):
         super(ConformerAlgoPerf, self).__init__()
         
-        # torchaudio의 Conformer 구현체 사용
         self.conformer = torchaudio.models.Conformer(
             input_dim=input_dim,
             num_heads=num_heads,
-            ffn_dim=encoder_dim * 4, # Feed Forward dimension usually 4x encoder dim
-            num_layers=num_layers,   # AlgoPerf: 4 layers [cite: 1892]
-            depthwise_conv_kernel_size=Config.depthwise_conv_kernel_size
+            ffn_dim=encoder_dim * 4,
+            num_layers=num_layers,
+            depthwise_conv_kernel_size=depthwise_kernel_size
         )
         
-        # Output Projection
         self.fc = nn.Linear(input_dim, num_classes) 
-        # Note: torchaudio Conformer outputs same dim as input if input_dim match
-        # But typically Conformer is (Input -> Linear -> Conformer -> Linear)
-        # For simplicity matching dimension:
         self.input_projection = nn.Linear(input_dim, input_dim) 
-        
-        # Initialization [cite: 1892]
         self._init_weights()
 
     def _init_weights(self):
-        # Xavier uniform initialization
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
     def forward(self, x, input_lengths):
-        # x: (Batch, Time, Freq)
-        
-        # Input Projection
         x = self.input_projection(x)
-        
-        # Conformer Forward
-        # out: (Batch, Time, input_dim), lengths: (Batch,)
         out, out_lengths = self.conformer(x, input_lengths)
-        
-        # Final Linear
-        out = self.fc(out) # (Batch, Time, Classes)
-        
-        # Log Softmax for CTC
+        out = self.fc(out)
         out = F.log_softmax(out, dim=2)
-        
-        # (Batch, Time, Classes) -> (Time, Batch, Classes)
-        out = out.transpose(0, 1)
-        
+        out = out.transpose(0, 1) # (Time, Batch, Classes) for CTC
         return out, out_lengths
 
 # ==========================================
-# 5. Training Loop
+# 4. Main Training Loop
 # ==========================================
-def train():
-    # 1. Data Setup
-    print("Loading LibriSpeech dataset...")
+
+def main(args):
+    local_rank = setup()
+    global_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    
+    set_seed_distributed(args.seed, global_rank)
+
+    if global_rank == 0:
+        print(f"Training Config: {args}")
+        print(f"World Size: {world_size}, Local Rank: {local_rank}")
+
+    # --- Data Preparation ---
+    if global_rank == 0:
+        if not os.path.exists(args.data_path):
+            os.makedirs(args.data_path)
+        # 다운로드 (메인 프로세스만)
+        torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-clean-100", download=True)
+    dist.barrier()
+
     train_dataset = AlgoPerfLibriSpeech(
-        root=Config.data_path, 
+        root=args.data_path, 
         url="train-clean-100", 
-        download=True, 
-        train=True
+        download=False, # 위에서 이미 다운로드 함
+        train=True,
+        args=args
     )
     
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True)
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=Config.batch_size, 
-        shuffle=True, 
+        batch_size=args.batch_size, 
+        sampler=train_sampler,
+        num_workers=args.workers,
         collate_fn=collate_fn,
+        pin_memory=True,
         drop_last=True
     )
 
-    # 2. Model Setup
-    # Vocab size + 1 (Blank)
+    # --- Model Setup ---
     model = ConformerAlgoPerf(
         num_classes=len(text_transform),
-        input_dim=Config.n_mels,
-        encoder_dim=Config.encoder_dim,
-        num_layers=Config.num_layers,
-        num_heads=Config.num_heads
-    ).to(Config.device)
+        input_dim=args.n_mels,
+        encoder_dim=args.encoder_dim,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        depthwise_kernel_size=args.depthwise_kernel_size
+    ).to(local_rank)
+
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    # --- Optimizer Setup (Shampoo) ---
+    # Eigh fallback logging setup
+    eigh_fallback_handler = EighFallbackCounter()
+    matrix_logger = logging.getLogger('optimizers.matrix_functions')
+    matrix_logger.setLevel(logging.WARNING)
+    matrix_logger.addHandler(eigh_fallback_handler)
+
+    distributed_config = DDPShampooConfig(
+        communication_dtype=CommunicationDType.FP32,
+        num_trainers_per_group=world_size,
+        communicate_params=False
+    )
+
+    optimizer = DistributedShampoo(
+        params=model.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        weight_decay=args.weight_decay,
+        epsilon=1e-12,
+        momentum=0.0,
+        max_preconditioner_dim=args.max_preconditioner_dim,
+        precondition_frequency=args.precondition_frequency,
+        start_preconditioning_step=args.start_preconditioning_step,
+        grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-8),
+        use_decoupled_weight_decay=True,
+        distributed_config=distributed_config,
+        preconditioner_dtype=torch.float32,
+        use_protected_eigh=True
+    )
+
+    criterion = nn.CTCLoss(blank=len(text_transform)-1).to(local_rank)
     
-    # 3. Loss & Optimizer
-    # CTC Loss 
-    criterion = nn.CTCLoss(blank=len(text_transform)-1).to(Config.device)
-    
-    # AlgoPerf uses AdamW/NadamW mostly
-    optimizer = optim.AdamW(model.parameters(), lr=Config.learning_rate)
-    
-    print(f"Conformer Model Created. Layers: {Config.num_layers}, Dim: {Config.encoder_dim}")
-    print("Start Training...")
-    
+    total_steps = len(train_loader) * args.epochs
+    global_step = 0
+
+    if global_rank == 0:
+        print("Start Training...")
+
     model.train()
-    for epoch in range(Config.epochs):
-        running_loss = 0.0
+    for epoch in range(args.epochs):
+        train_sampler.set_epoch(epoch)
+        epoch_loss = 0.0
+        valid_batches = 0
+        
         for batch_idx, (spectrograms, labels, input_lengths, label_lengths) in enumerate(train_loader):
             if spectrograms is None: continue
-                
-            spectrograms = spectrograms.to(Config.device) # (B, T, F)
-            labels = labels.to(Config.device)
-            input_lengths = input_lengths.to(Config.device)
-            label_lengths = label_lengths.to(Config.device)
             
+            spectrograms = spectrograms.to(local_rank, non_blocking=True)
+            labels = labels.to(local_rank, non_blocking=True)
+            input_lengths = input_lengths.to(local_rank, non_blocking=True)
+            label_lengths = label_lengths.to(local_rank, non_blocking=True)
+            
+            # Learning Rate Schedule
+            current_lr = get_lr_schedule(global_step, args.warmup_steps, args.lr, total_steps)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+
             optimizer.zero_grad()
             
             # Forward
             outputs, output_lengths = model(spectrograms, input_lengths)
             
-            # CTC Loss
+            # Loss
             loss = criterion(outputs, labels, output_lengths, label_lengths)
             
             if torch.isnan(loss) or torch.isinf(loss):
-                print("Warning: NaN or Inf loss detected. Skipping batch.")
+                if global_rank == 0:
+                    print(f"Warning: NaN/Inf loss at step {global_step}. Skipping.")
                 continue
 
             loss.backward()
             
-            # Gradient Clipping is often helpful for Conformer/Transformer
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             
             optimizer.step()
             
-            running_loss += loss.item()
+            epoch_loss += loss.item()
+            valid_batches += 1
+            global_step += 1
             
-            if batch_idx % 10 == 0:
-                print(f"Epoch [{epoch+1}/{Config.epochs}], Step [{batch_idx}/{len(train_loader)}], Loss: {loss.item():.4f}")
+            if batch_idx % args.log_interval == 0 and global_rank == 0:
+                print(f"Epoch [{epoch+1}/{args.epochs}], Step [{batch_idx}/{len(train_loader)}], "
+                      f"Loss: {loss.item():.4f}, LR: {current_lr:.6f}")
 
-    print("Training Finished.")
+        # Epoch Summary
+        if global_rank == 0:
+            avg_loss = epoch_loss / valid_batches if valid_batches > 0 else 0.0
+            print(f"==> Epoch {epoch+1} Finished. Avg Loss: {avg_loss:.4f}")
+            print(f"    Eigh Fallbacks (Epoch): {eigh_fallback_handler.count}")
+            eigh_fallback_handler.count = 0 # Reset counter
+
+        if (epoch + 1) % args.save_interval == 0:
+            if global_rank == 0:
+                save_path = os.path.join(args.checkpoint_dir, f"conformer_epoch_{epoch+1}.pth")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.module.state_dict(),
+                    'optimizer_state_dict': optimizer.distributed_state_dict(key_to_param=model.module.named_parameters()),
+                    'loss': avg_loss,
+                }, save_path)
+                print(f"Checkpoint saved to {save_path}")
+            dist.barrier()
+
+    cleanup()
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description='Conformer Training with Distributed Shampoo')
+    
+    # Data Params
+    parser.add_argument('--data-path', type=str, default='./data', help='Dataset path')
+    parser.add_argument('--sample-rate', type=int, default=16000)
+    parser.add_argument('--n-fft', type=int, default=400)
+    parser.add_argument('--hop-length', type=int, default=160)
+    parser.add_argument('--n-mels', type=int, default=80)
+    parser.add_argument('--max-audio-length', type=int, default=320000)
+    
+    # Model Params
+    parser.add_argument('--encoder-dim', type=int, default=512)
+    parser.add_argument('--num-layers', type=int, default=16) # AlgoPerf default is deeper
+    parser.add_argument('--num-heads', type=int, default=8)
+    parser.add_argument('--depthwise-kernel-size', type=int, default=31)
+    
+    # Training Params
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch-size', type=int, default=32, help='Per-GPU batch size')
+    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--lr', type=float, default=0.002)
+    parser.add_argument('--warmup-steps', type=int, default=10000)
+    parser.add_argument('--weight-decay', type=float, default=1e-4)
+    parser.add_argument('--grad-clip', type=float, default=1.0)
+    parser.add_argument('--beta1', type=float, default=0.9)
+    parser.add_argument('--beta2', type=float, default=0.98) # Conformer typically uses slightly lower beta2
+    
+    # Shampoo Params
+    parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
+    parser.add_argument('--precondition-frequency', type=int, default=100)
+    parser.add_argument('--start-preconditioning-step', type=int, default=100)
+    
+    # Logistics
+    parser.add_argument('--log-interval', type=int, default=50)
+    parser.add_argument('--save-interval', type=int, default=5)
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
+    
+    args = parser.parse_args()
+    
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    
+    main(args)

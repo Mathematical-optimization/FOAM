@@ -214,6 +214,7 @@ def main(args):
     if global_rank == 0:
         print(f"Training Config: {args}")
         print(f"World Size: {world_size}, Local Rank: {local_rank}")
+        print(f"Model Architecture: Conformer {args.num_layers} layers (AlgoPerf Spec)")
 
     # --- Data Preparation ---
     if global_rank == 0:
@@ -361,7 +362,7 @@ def main(args):
     cleanup()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Conformer Training with Distributed Shampoo')
+    parser = argparse.ArgumentParser(description='Conformer Training with Distributed Shampoo (AlgoPerf)')
     
     # Data Params
     parser.add_argument('--data-path', type=str, default='./data', help='Dataset path')
@@ -371,15 +372,15 @@ if __name__ == "__main__":
     parser.add_argument('--n-mels', type=int, default=80)
     parser.add_argument('--max-audio-length', type=int, default=320000)
     
-    # Model Params
+    # Model Params (Updated for AlgoPerf)
     parser.add_argument('--encoder-dim', type=int, default=512)
-    parser.add_argument('--num-layers', type=int, default=16) # AlgoPerf default is deeper
+    parser.add_argument('--num-layers', type=int, default=4, help="AlgoPerf uses 4 layers") 
     parser.add_argument('--num-heads', type=int, default=8)
     parser.add_argument('--depthwise-kernel-size', type=int, default=31)
     
     # Training Params
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch-size', type=int, default=32, help='Per-GPU batch size')
+    parser.add_argument('--batch-size', type=int, default=64, help='Per-GPU batch size (adjusted for A6000)')
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--lr', type=float, default=0.002)
@@ -387,7 +388,7 @@ if __name__ == "__main__":
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--grad-clip', type=float, default=1.0)
     parser.add_argument('--beta1', type=float, default=0.9)
-    parser.add_argument('--beta2', type=float, default=0.98) # Conformer typically uses slightly lower beta2
+    parser.add_argument('--beta2', type=float, default=0.98) 
     
     # Shampoo Params
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024)

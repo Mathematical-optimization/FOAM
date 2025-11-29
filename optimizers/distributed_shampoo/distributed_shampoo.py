@@ -29,7 +29,7 @@ from .shampoo_types import (
     AdamGraftingConfig,
     BETAS,
     DDPShampooConfig,
-    DistributedConfig,
+    DistributedConfig,  # <--- [FIX] 누락된 DistributedConfig 추가
     DISTRIBUTOR,
     EPSILON,
     EPSILON_LEFT,
@@ -48,6 +48,8 @@ from .shampoo_types import (
     MASKED_FILTERED_GRAD_LIST,
     MASKED_MOMENTUM_LIST,
     MAX_PRECONDITIONER_DIM,
+    MATRIX_ROOT_INV_THRESHOLD,
+    MAX_EPSILON,
     MOMENTUM,
     MOMENTUM_LIST,
     PARAMS,
@@ -94,175 +96,11 @@ from .utils.shampoo_utils import compress_list
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-EPSILON = 1e-16
+EPSILON_DEFAULT = 1e-16
 
 
 class DistributedShampoo(torch.optim.Optimizer):
-    """Implements distributed Shampoo algorithm.
-
-    Developers:
-        Hao-Jun Michael Shi (Meta Platforms, Inc.)
-        Tsung-Hsien Lee
-        Anna Cai (Meta Platforms, Inc.)
-        Shintaro Iwasaki (Meta Platforms, Inc.)
-        Ke Sang (Meta Platforms, Inc.)
-        Wang Zhou (Meta Platforms, Inc.)
-
-    with contributions and support from:
-
-    Rohan Anil (Google), Adnan Aziz (Meta), Pavan Balaji (Meta), Shuo Chang (Meta), Weiwei Chu (Meta), Assaf Eisenman (Meta),
-    Will Feng (Meta), Zhuobo Feng (Meta), Jose Gallego-Posada (Mila / Meta Platforms, Inc.), Avirup Ghosh (Meta), Yizi Gu (Meta),
-    Vineet Gupta (Google), Yuchen Hao (Meta), Brian Hirsh (Meta), Yusuo Hu (Meta), Yuxi Hu (Meta), Minhui Huang (Meta),
-    Guna Lakshminarayanan (Meta), Michael Lazos (Meta), Zhijing Li (Meta), Ming Liang (Meta), Wanchao Liang (Meta), Ying Liu
-    (Meta), Wenguang Mao (Meta), Dheevatsa Mudigere (NVIDIA), Maxim Naumov (Meta), Jongsoo Park (Meta), Mike Rabbat (Meta),
-    Kaushik Rangadurai (Meta), Dennis van der Staay (Meta), Fei Tian (Meta), Sanjay Vishwakarma (Meta), Xunnan (Shawn) Xu (Meta),
-    Jiyan Yang (Meta), Chunxing Yin (Meta), and Iris Zhang (Meta).
-
-    Details in: https://arxiv.org/pdf/2309.06497.pdf.
-
-    Partly based on the work in:
-    - https://arxiv.org/pdf/1802.09568.pdf
-    - https://arxiv.org/pdf/2002.09018.pdf
-
-    ------------
-    Requirements
-    ------------
-
-    1. PyTorch >= 2.0
-    2. Python >= 3.8
-    3. CUDA 11.3, 11.4, 12.2+
-
-    In order to support checkpointing, one must use torch.distributed.checkpoint and pass the named parameters into state_dict.
-    Note that the standard checkpointing solution by PyTorch is not supported!
-
-    Note: We have observed known instabilities with the torch.linalg.eigh operator on CUDA 11.6-12.1, specifically for low-rank
-    matrices, which may appear with using a small start_preconditioning_step. Please avoid these versions of CUDA if possible.
-    See: https://github.com/pytorch/pytorch/issues/94772.
-
-    --------
-    Features
-    --------
-
-    1. Layerwise Grafting: In order to tune Shampoo, we can "graft" a layer-wise learning rate schedule from a previous method
-        and apply it to Shampoo. This is performed by taking the norm of the layer-wise step of the grafted method, normalizing
-        the Shampoo step, and re-scaling the normalized Shampoo step by the product of the norm of the grafted step + learning rate.
-
-        This may be interpreted as an additional block re-scaling of the entire Shampoo preconditioner.
-        This is the key ingredient to making Shampoo work in practice.
-
-        We support the following methods:
-            - GraftingType.NONE: Performs no grafting.
-            - GraftingType.SGD: Grafts the stochastic gradient method.
-            - GraftingType.ADAGRAD: Grafts the Adagrad method.
-            - GraftingType.RMSPROP: Grafts the RMSProp method.
-            - GraftingType.ADAM: Grafts the Adam method.
-
-        NOTE: These methods do not graft the first-moment component - it is entirely based upon grafting using the
-        diagonal preconditioner. If using an exponential moving average of the gradient (or gradient filtering), we
-        can set beta1 as the same value from before, and both Shampoo and the grafted method will use the filtered
-        gradient.
-
-    2. Blocking for Large-Dimensional Tensors: In order to scale Shampoo to large-dimensional tensors, we block the tensor
-        and apply Shampoo to each block. For simplicity, suppose we have a linear layer/matrix parameter, W is a m x n matrix:
-
-                [[w_11 w_12 ... w_1n]
-                [w_21 w_22 ... w_2n]
-            W =           :
-                [w_m1 w_m2 ... w_mn]]
-
-        Given a max_preconditioner_dim b > 0, blocks W and applies Shampoo to each block, i.e., if b divides both m, n, then:
-
-                [[W_11 W_12 ... W_1k]
-                 [W_21 W_22 ... W_2k]
-            W =           :
-                 [W_l1 W_l2 ... W_lk]]
-
-        where l = m / b, k = n / b, and apply Shampoo to W_ij which is a b x b matrix. This can be viewed as further blocking
-        each block of the Shampoo block-diagonal preconditioner.
-
-        Computational cost = O(b^3)
-        Memory cost = 4mn (including root inverse preconditioners)
-
-    3. Distributed Memory and Computation: We support different distributed training setups through the distributed_config option,
-        which specifies a configuration specific to that setting.
-
-        - None: Performs serial single-GPU training. Replicates all computation and optimizer states across all
-            devices.
-
-        - DDPShampooConfig: Supports multi-GPU distributed data-parallel training via torch.distributed. Assigns optimizer states
-            and computation for each block in a greedy fashion to different workers. Leverages DTensor in order to distribute the
-            per-block optimizer states from Shampoo. An AllGather communication is performed in order to synchronize the parameter
-            updates to applied to all parameter blocks.
-
-            Distributed Training Specific Fields:
-                - communication_dtype: We can specify the communication dtype used for the AllGather communication in order to
-                    reduce communication overhead per-iteration.
-                - num_trainers_per_group: Specifies the number of GPUs used per distributed group. This enables us to only
-                    distribute computation across a subset of GPUs, and replicate the same computation across different distributed
-                    groups. This is useful for performance by trading off communication costs vs. computational costs.
-                - communicate_params: We offer the option to communicate the parameter updates or the updated parameters. Enabling
-                    this option specifically communicates the updated parameters. Note that using a lower-precision
-                    communication_dtype is more amenable to the case where this option is disabled (i.e., we are communicating the
-                    parameter updates).
-
-            Requirements:
-                - torch.distributed must be initialized in advance.
-                - Only supports homogeneous hardware architectures.
-
-        - FSDPShampooConfig: Supports multi-GPU fully-sharded data-parallel training via torch.distributed. This option uses
-            additional metadata in order to reconstruct valid tensor blocks of the original parameter from the flattened parameter
-            representation.
-
-            Distributed Training Specific Fields:
-                - param_to_metadata: One must create a dictionary containing the metadata for each parameter in the FSDP model. This
-                    includes the shape of the original parameter as well as the start and end indices of the tensor shard with
-                    respect to the unsharded flattened parameter.
-
-            Requirements:
-                - torch.distributed must be initialized in advance.
-                - One must enable the option use_orig_params = True in FSDP.
-
-    Args:
-        params (iterable): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate. (Default: 1e-2)
-        betas (Tuple[float, float]): Coefficients used for computing running averages of gradient and its square.
-            (Default: (0.9, 1.0))
-        epsilon (float): Term added to the denominator to improve numerical stability. (Default: 1e-12)
-        momentum (float): Momentum parameter. (default: 0.)
-        weight_decay (float): Weight decay (L2 penalty). (Default: 0.)
-        max_preconditioner_dim (int): Maximum preconditioner dimensio. (Default: 1024)
-        precondition_frequency (int): Frequency for computing root inverse preconditioner. (Default: 1)
-        start_preconditioning_step (int): Iteration to start computing inverse preconditioner. If -1, uses
-            the same value as precondition_frequency. (Default: -1)
-        inv_root_override (int, Sequence[int]): Inverse root to use in Shampoo. If a list [l1, l2, ..., lp], then we will
-            use -1 / l1 for 1-D tensor (vectors), -1 / l2 for 2-D tensors (matrices), and so on. If the order of the
-            tensor exceeds the order of the tensor, reverts to the default value. If 0 is used, uses the default inverse
-            root -1 / (2 * o), where o is the order of the tensor. (Default: 0)
-        exponent_multiplier (float): Number to be multiplied to the numerator of the inverse root, i.e., eta where the
-            exponent is -eta / (2 * p). (Default: 1.0)
-        use_nadam (bool): Use NAdam style convex combination of first moment estimate and current gradient.
-            (Default: False)
-        use_nesterov (bool): Flag for using Nesterov momentum. (default: False)
-        use_bias_correction (bool): Flag for using bias correction. (Default: True)
-        use_decoupled_weight_decay (bool): Flag for using AdamW-style decoupled weight decay. (Default: True)
-        grafting_config (Optional[GraftingConfig]): Configuration for grafting method. If None, ignores grafting.
-            (Default: None)
-        use_normalized_grafting (bool): Flag for normalizing gradient before passing to grafting method.
-            (Default: False)
-        use_merge_dims (bool): Merge dimensions if possible while respecting max_preconditioner_dim. (Default: True)
-        use_pytorch_compile (bool): Use PyTorch 2.0 compiler feature to speed up training. (Default: False)
-        distributed_config (Optional[DistributedConfig]): Configuration for applying Shampoo
-            to different distributed training frameworks, such as distributed-data parallel (DDP) training.
-            Based on the configuration, determines which version of Shampoo to use. (Default: None)
-        preconditioner_dtype (torch.dtype): Data type for preconditioner. (Default: torch.float)
-        use_protected_eigh (bool): Flag for using two guards to prevent failures of torch.linalg.eigh. (Default: True)
-            1. Attempts to compute root inverse in preconditioner_dtype precision.
-            2. Attempts to recompute the eigendecomposition in higher precision if using lower-precision fails.
-            3. Otherwise, re-uses previous inverse factor matrix when both root inverse computations fail.
-        track_root_inv_residuals (bool): Track errors and residuals of root inverse. For debugging purposes.
-            (Default: False)
-
-    """
+    """Implements distributed Shampoo algorithm (DryShampoo)."""
 
     def __init__(
         self,
@@ -270,10 +108,8 @@ class DistributedShampoo(torch.optim.Optimizer):
         lr: float = 1e-2,
         betas: Tuple[float, float] = (0.9, 1.0),
         epsilon: float = 1e-12,
-        epsilon_left : Optional[float] = None,
-        epsilon_right : Optional[float] =None,
-        use_adaptive_epsilon:bool=False,
-        condition_thresholds:Optional[Dict[float,float]] = None,
+        epsilon_left: Optional[float] = None,
+        epsilon_right: Optional[float] = None,
         momentum: float = 0.0,
         weight_decay: float = 0.0,
         max_preconditioner_dim: int = 1024,
@@ -294,8 +130,11 @@ class DistributedShampoo(torch.optim.Optimizer):
         preconditioner_dtype: torch.dtype = torch.float32,
         use_protected_eigh: bool = True,
         track_root_inv_residuals: bool = False,
-        use_trace_correction: bool = False,
-        matrix_root_inv_threshold: float = 0.0,
+        # DryShampoo Specific Arguments
+        matrix_root_inv_threshold: float = 0.0,  # tau
+        max_epsilon: float = 1.0, # epsilon_max
+        use_adaptive_epsilon: bool = False, # Compatibility argument
+        condition_thresholds: Optional[Dict[float, float]] = None, # Compatibility argument
     ) -> None:
         # Hyperparameter checks.
         if not lr >= 0.0:
@@ -311,15 +150,8 @@ class DistributedShampoo(torch.optim.Optimizer):
         if not epsilon > 0.0:
             raise ValueError(f"Invalid epsilon value: {epsilon}. Must be > 0.0.")
         
-        # Optimize epsilon configuration for default and asymmetric cases
         actual_epsilon_left = epsilon_left if epsilon_left is not None else epsilon
         actual_epsilon_right = epsilon_right if epsilon_right is not None else epsilon
-        
-        # Fast check for default configuration
-        is_default_config = (not use_adaptive_epsilon and 
-                           epsilon_left is None and 
-                           epsilon_right is None and
-                           matrix_root_inv_threshold == 0.0)
         
         if not 0.0 <= momentum < 1.0:
             raise ValueError(
@@ -339,7 +171,7 @@ class DistributedShampoo(torch.optim.Optimizer):
             )
         if not start_preconditioning_step >= -1:
             raise ValueError(
-                f"Invalid start preconditioning step: {start_preconditioning_step}. Must be >= -1."
+                f"Invalid start_preconditioning_step: {start_preconditioning_step}. Must be >= -1."
             )
         if isinstance(inv_root_override, Sequence):
             if not all(e >= 0 for e in inv_root_override):
@@ -366,21 +198,18 @@ class DistributedShampoo(torch.optim.Optimizer):
                 f"Invalid start_preconditioning_step value: {start_preconditioning_step}. Must be >= {precondition_frequency=}."
             )
 
-        # Warn when NAdam is used but beta1 is 0.
         if use_nadam and betas[0] == 0.0:
             logger.warning(
                 "NAdam flag is enabled but beta1 parameter is zero! "
                 "Continuing without using NAdam..."
             )
 
-        # Warn when Nesterov is used but momentum is 0.
         if use_nesterov and momentum == 0.0:
             logger.warning(
                 "Nesterov flag is enabled but momentum parameter is zero! "
                 "Continuing without using momentum or Nesterov acceleration..."
             )
 
-        # Provide error for system Pytorch compile availability
         if use_pytorch_compile and not torch.cuda.is_available():
             raise ValueError(
                 "Backend does NOT support Pytorch 2.0 compile. Switch to use_pytorch_compile=False."
@@ -392,11 +221,10 @@ class DistributedShampoo(torch.optim.Optimizer):
                 LR: lr,
                 BETAS: betas,
                 EPSILON: epsilon,
-                EPSILON_LEFT : actual_epsilon_left,
+                EPSILON_LEFT: actual_epsilon_left,
                 EPSILON_RIGHT: actual_epsilon_right,
-                'USE_ADAPTIVE_EPSILON' : use_adaptive_epsilon,
-                'CONDITION_THRESHOLDS' : condition_thresholds,
-                'IS_DEFAULT_CONFIG': is_default_config,  # Store for fast path
+                MATRIX_ROOT_INV_THRESHOLD: matrix_root_inv_threshold,
+                MAX_EPSILON: max_epsilon,
                 MOMENTUM: momentum,
                 WEIGHT_DECAY: weight_decay,
                 MAX_PRECONDITIONER_DIM: max_preconditioner_dim,
@@ -413,8 +241,6 @@ class DistributedShampoo(torch.optim.Optimizer):
                 USE_EMA_MOMENTUM: use_ema_momentum,
                 USE_MERGE_DIMS: use_merge_dims,
                 PRECONDITIONER_DTYPE: preconditioner_dtype,
-                'USE_TRACE_CORRECTION' : use_trace_correction,
-                "matrix_root_inv_threshold":matrix_root_inv_threshold,
             },
         )
 
@@ -431,8 +257,7 @@ class DistributedShampoo(torch.optim.Optimizer):
 
         # Block parameters and instantiate optimizer states.
         self._instantiate_distributor()
-        # We only instantiate Shampoo if start_preconditioning_step is finite;
-        # otherwise, this is equivalent to only running the grafting method.
+        
         if start_preconditioning_step < torch.inf:
             self._instantiate_shampoo_preconditioner_list()
         self._instantiate_grafting()
@@ -442,26 +267,7 @@ class DistributedShampoo(torch.optim.Optimizer):
         self._instantiate_device()
 
         # Use PT2 to compile the step function for each parameter group
-        self._per_group_step: Callable[
-            [
-                Dict[str, Any],
-                torch.Tensor,
-                torch.Tensor,
-                float,
-                float,
-                float,
-                bool,
-                bool,
-                bool,
-                bool,
-                bool,
-                bool,
-                bool,
-                bool,
-                bool,
-            ],
-            None,
-        ] = (
+        self._per_group_step: Callable = (
             torch.compile(self._per_group_step_impl, backend="inductor")
             if self._use_pytorch_compile
             else self._per_group_step_impl
@@ -509,21 +315,19 @@ class DistributedShampoo(torch.optim.Optimizer):
                 distributor_selector=state_lists[DISTRIBUTOR].distributor_selector,
                 beta2=group[BETAS][1],
                 epsilon=group[EPSILON],
-                epsilon_left = group[EPSILON_LEFT],
-                epsilon_right = group[EPSILON_RIGHT],
-                use_adaptive_epsilon = group.get('USE_ADAPTIVE_EPSILON', False),
-                condition_thresholds = group.get('CONDITION_THRESHOLDS', None),
-                is_default_config = group.get('IS_DEFAULT_CONFIG', False),  # Pass optimization flag
+                epsilon_left=group[EPSILON_LEFT],
+                epsilon_right=group[EPSILON_RIGHT],
+                # DryShampoo params
+                matrix_root_inv_threshold=group[MATRIX_ROOT_INV_THRESHOLD],
+                max_epsilon=group[MAX_EPSILON],
+                
                 inv_root_override=group[INV_ROOT_OVERRIDE],
                 exponent_multiplier=group[EXPONENT_MULTIPLIER],
                 use_bias_correction=group[USE_BIAS_CORRECTION],
                 factor_matrix_dtype=group[PRECONDITIONER_DTYPE],
                 use_protected_eigh=self._use_protected_eigh,
-                use_trace_correction = group.get('USE_TRACE_CORRECTION', False),
-                matrix_root_inv_threshold = group.get("matrix_root_inv_threshold", 0.0),
             )
 
-    # ... rest of the methods remain the same ...
     @torch.no_grad()
     def _instantiate_grafting(self) -> None:
         for state_lists, group in zip(
@@ -572,8 +376,7 @@ class DistributedShampoo(torch.optim.Optimizer):
         for state_lists in self._per_group_state_lists:
             assert (
                 len(state_lists[DISTRIBUTOR].global_block_info_list) > 0
-            ), "There is no params in your param_group. Please check the instantiation of DistributedShampoo "
-            'with param_group containing no params. For example, DistributedShampoo(params=[{"params": []}])'
+            ), "There is no params in your param_group."
             # NOTE: We instantiate a single step tensor on CPU for each group in order
             #       to track the number of steps taken by all parameters within the group.
             #       Instantiating on CPU avoids GPU synchronization.
@@ -602,10 +405,7 @@ class DistributedShampoo(torch.optim.Optimizer):
                     block_index := block_info.composable_block_ids[1]
                 ) in self.state[
                     block_info.param
-                ], f"{block_index=} not found in {self.state[block_info.param]=}. "
-                "Please check the initialization of self.state[block_info.param][block_index] within "
-                "PreconditionerList, and check the initialization of BlockInfo within Distributor "
-                "for the correctness of block_index."
+                ], f"{block_index=} not found in {self.state[block_info.param]=}."
                 block_state = self.state[block_info.param][block_index]
 
                 block_state[MOMENTUM] = block_info.allocate_zeros_tensor(
@@ -644,10 +444,7 @@ class DistributedShampoo(torch.optim.Optimizer):
                     block_index := block_info.composable_block_ids[1]
                 ) in self.state[
                     block_info.param
-                ], f"{block_index=} not found in {self.state[block_info.param]=}. "
-                "Please check the initialization of self.state[block_info.param][block_index] "
-                "within PreconditionerList, and check the initialization of BlockInfo within "
-                "Distributor for the correctness of block_index."
+                ], f"{block_index=} not found in {self.state[block_info.param]=}."
                 block_state = self.state[block_info.param][block_index]
 
                 block_state[FILTERED_GRAD] = block_info.allocate_zeros_tensor(
@@ -710,62 +507,12 @@ class DistributedShampoo(torch.optim.Optimizer):
             )
 
     @torch.no_grad()
-    def _compute_and_log_root_inverse_residuals(
-        self,
-    ) -> None:
-        """Compute root inverse residuals over all preconditioners.
-
-        Uses infinity norm to evaluate residuals and errors.
-        """
-
-        for (group_index, group), state_lists in zip(
-            enumerate(self.param_groups), self._per_group_state_lists,
-        ):
-
-            # Get expected relative errors/residuals for debugging purposes
-            if group[PRECONDITIONER_DTYPE] == torch.float64:
-                expected_relative_error = 1e-7
-            elif group[PRECONDITIONER_DTYPE] == torch.float32:
-                expected_relative_error = 1e-3
-            else:
-                logger.warning(
-                    "Expected relative error/residual not supported for precision lower than float32."
-                )
-                continue
-
-            relative_errors, relative_residuals = state_lists[
-                SHAMPOO_PRECONDITIONER_LIST
-            ].compute_root_inverse_residuals()
-
-            relative_errors = torch.stack(relative_errors)
-            relative_residuals = torch.stack(relative_residuals)
-
-            quantiles = torch.as_tensor(
-                [0, 0.25, 0.5, 0.75, 1],
-                device=relative_errors.device,
-                dtype=relative_errors.dtype,
-            )
-            logger.debug(f"Group Index: {group_index}")
-            logger.debug(f"Expect Relative Error <= {expected_relative_error}")
-            logger.debug(
-                f"Relative Error (||X - X_hat||_inf / ||X||_inf)       Average: {torch.mean(relative_errors)}, "
-                f"Quantiles [0, 25, 50, 75, 100]: {torch.quantile(relative_errors, quantiles, interpolation='nearest')}"
-            )
-            logger.debug(
-                f"Relative Residual (||X_hat^-r - A||_inf / ||A||_inf) Average: {torch.mean(relative_residuals)}, "
-                "Quantiles [0, 25, 50, 75, 100]: "
-                f"{torch.quantile(relative_residuals, quantiles, interpolation='nearest')}"
-            )
-
-    @torch.no_grad()
     @torch.compiler.disable
     def _compute_root_inverse(
         self, state_lists: Dict[str, Any], compute_root_inverse: bool
     ) -> None:
         if compute_root_inverse:
             state_lists[SHAMPOO_PRECONDITIONER_LIST].compute_root_inverse()
-            if self._track_root_inv_residuals:
-                self._compute_and_log_root_inverse_residuals()
 
     @torch.no_grad()
     def _per_group_step_impl(
@@ -803,7 +550,7 @@ class DistributedShampoo(torch.optim.Optimizer):
         if grafting_config_not_none:
             state_lists[GRAFTING_PRECONDITIONER_LIST].update_preconditioners(
                 masked_grad_list=tuple(
-                    blocked_grad / (grad_norm + EPSILON) for blocked_grad, grad_norm in zip(
+                    blocked_grad / (grad_norm + EPSILON_DEFAULT) for blocked_grad, grad_norm in zip(
                         state_lists[MASKED_BLOCKED_GRADS],
                         torch._foreach_norm(state_lists[MASKED_BLOCKED_GRADS]),
                     )
@@ -865,7 +612,7 @@ class DistributedShampoo(torch.optim.Optimizer):
                 # Note that this is not equal to the per-block filtered gradient list.
                 if use_normalized_grafting:
                     masked_filtered_grad_list = tuple(
-                        blocked_grad / (grad_norm + EPSILON) for blocked_grad, grad_norm in zip(
+                        blocked_grad / (grad_norm + EPSILON_DEFAULT) for blocked_grad, grad_norm in zip(
                             state_lists[MASKED_BLOCKED_GRADS],
                             torch._foreach_norm(state_lists[MASKED_BLOCKED_GRADS]),
                         )
@@ -879,7 +626,7 @@ class DistributedShampoo(torch.optim.Optimizer):
                 shampoo_norm_list = torch._foreach_norm(
                     masked_blocked_search_directions
                 )
-                torch._foreach_add_(shampoo_norm_list, EPSILON)
+                torch._foreach_add_(shampoo_norm_list, EPSILON_DEFAULT)
                 torch._foreach_div_(grafting_norm_list, shampoo_norm_list)
                 torch._foreach_mul_(
                     masked_blocked_search_directions, grafting_norm_list
@@ -968,12 +715,16 @@ class DistributedShampoo(torch.optim.Optimizer):
             weight_decay = group[WEIGHT_DECAY]
             momentum_param = group[MOMENTUM]
             grafting_config_not_none = group[GRAFTING_CONFIG] is not None
+            
             # Check compute root inverse or not for preconditioner
+            # For DryShampoo, we *always* call compute_root_inverse, but inside it decides whether to actually update or not
+            # based on the threshold. So we pass True here if we are past the start step.
             compute_root_inverse = (
                 step % group[PRECONDITION_FREQUENCY] == 0
                 and step > group[START_PRECONDITIONING_STEP]
                 or step == group[START_PRECONDITIONING_STEP]
             )
+            
             use_decoupled_weight_decay = group[USE_DECOUPLED_WEIGHT_DECAY]
             use_bias_correction = group[USE_BIAS_CORRECTION]
             # Check applying grafting method or not

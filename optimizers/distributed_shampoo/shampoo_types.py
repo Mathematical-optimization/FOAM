@@ -22,8 +22,8 @@ STEP = "step"
 # Keys for parameter groups (checkpointed if specified)
 BETAS = "betas"
 EPSILON = "epsilon"
-EPSILON_LEFT = "epsilon_left"          # NEW
-EPSILON_RIGHT = "epsilon_right"        # NEW
+EPSILON_LEFT = "epsilon_left"
+EPSILON_RIGHT = "epsilon_right"
 EXPONENT_MULTIPLIER = "exponent_multiplier"
 GRAFTING_CONFIG = "grafting_config"
 INV_ROOT_OVERRIDE = "inv_root_override"
@@ -41,6 +41,10 @@ USE_NADAM = "use_nadam"
 USE_NESTEROV = "use_nesterov"
 USE_NORMALIZED_GRAFTING = "use_normalized_grafting"
 WEIGHT_DECAY = "weight_decay"
+
+# DryShampoo Hyperparameters
+MATRIX_ROOT_INV_THRESHOLD = "matrix_root_inv_threshold"  # tau
+MAX_EPSILON = "max_epsilon"  # epsilon_max
 
 # Keys for lists of blocked states and metadata (never checkpointed)
 DISTRIBUTOR = "distributor"

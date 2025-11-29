@@ -205,13 +205,17 @@ class ShampooMonitor:
         self.save_dir = save_dir
         self.rank = rank
         
-        # Feature 1: Epoch별 업데이트 비율 저장
-        self.epoch_update_stats = defaultdict(lambda: {'updated': 0, 'total': 0})
+        # Feature 1: Epoch별 업데이트 비율 저장 (L, R 분리)
+        # 구조: {epoch: {'L_total': 0, 'L_updated': 0, 'R_total': 0, 'R_updated': 0}}
+        self.epoch_stats = defaultdict(lambda: {
+            'L_updated': 0, 'L_total': 0, 
+            'R_updated': 0, 'R_total': 0
+        })
         
         # Feature 2: 파라미터 블록별 누적 업데이트 횟수
-        self.block_update_stats = defaultdict(lambda: {'L': 0, 'R': 0, 'total_steps': 0})
+        self.block_update_stats = defaultdict(lambda: {'L_updated': 0, 'L_total': 0, 'R_updated': 0, 'R_total': 0})
         
-        # Feature 4: Epoch별 Eigendecomposition 시간 저장 (New)
+        # Feature 4: Epoch별 Eigendecomposition 시간 저장
         self.epoch_eigh_times = {}
         
         self.param_index_to_name = {}
@@ -230,18 +234,20 @@ class ShampooMonitor:
         """Shampoo 내부에서 호출될 로깅 함수"""
         if self.rank != 0: return
 
-        # Feature 1 Data
-        self.epoch_update_stats[epoch]['total'] += 1
+        # dim_idx 0 -> L, 1 -> R
+        key_prefix = 'L' if dim_idx == 0 else 'R'
+
+        # Feature 1 Data (Global)
+        self.epoch_stats[epoch][f'{key_prefix}_total'] += 1
         if updated:
-            self.epoch_update_stats[epoch]['updated'] += 1
+            self.epoch_stats[epoch][f'{key_prefix}_updated'] += 1
             
-        # Feature 2 Data
+        # Feature 2 Data (Per Block)
         param_name = self.param_index_to_name.get(str(param_idx), f"param_{param_idx}")
-        dim_str = 'L' if dim_idx == 0 else 'R'
         
-        self.block_update_stats[param_name]['total_steps'] += 1
+        self.block_update_stats[param_name][f'{key_prefix}_total'] += 1
         if updated:
-            self.block_update_stats[param_name][dim_str] += 1
+            self.block_update_stats[param_name][f'{key_prefix}_updated'] += 1
 
     def log_eigh_time(self, epoch, time_sec):
         """Epoch별 Eigendecomposition 시간 기록 (New)"""
@@ -253,48 +259,80 @@ class ShampooMonitor:
         
         os.makedirs(self.save_dir, exist_ok=True)
 
-        # --- 1. Epoch별 업데이트 비율 그래프 ---
-        epochs = sorted(self.epoch_update_stats.keys())
-        ratios = []
+        # --- 1. Epoch별 업데이트 비율 그래프 (L/R 분리) ---
+        epochs = sorted(self.epoch_stats.keys())
+        
+        # Plot L
+        l_ratios = []
         for e in epochs:
-            stat = self.epoch_update_stats[e]
-            if stat['total'] > 0:
-                ratios.append(100.0 * stat['updated'] / stat['total'])
-            else:
-                ratios.append(0.0)
-                
+            s = self.epoch_stats[e]
+            ratio = 100.0 * s['L_updated'] / s['L_total'] if s['L_total'] > 0 else 0.0
+            l_ratios.append(ratio)
+            
         plt.figure(figsize=(10, 6))
-        plt.plot(epochs, ratios, marker='o', linestyle='-', color='b')
-        plt.title(f'Shampoo Preconditioner Update Percentage per Epoch')
+        plt.plot(epochs, l_ratios, marker='o', linestyle='-', color='b')
+        plt.title(f'Shampoo L-Factor Update Percentage per Epoch')
         plt.xlabel('Epoch')
         plt.ylabel('Update Percentage (%)')
         plt.grid(True)
-        plt.savefig(os.path.join(self.save_dir, 'shampoo_update_percentage.png'))
+        plt.savefig(os.path.join(self.save_dir, 'shampoo_update_percentage_L.png'))
+        plt.close()
+
+        # Plot R
+        r_ratios = []
+        for e in epochs:
+            s = self.epoch_stats[e]
+            ratio = 100.0 * s['R_updated'] / s['R_total'] if s['R_total'] > 0 else 0.0
+            r_ratios.append(ratio)
+            
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, r_ratios, marker='o', linestyle='-', color='r')
+        plt.title(f'Shampoo R-Factor Update Percentage per Epoch')
+        plt.xlabel('Epoch')
+        plt.ylabel('Update Percentage (%)')
+        plt.grid(True)
+        plt.savefig(os.path.join(self.save_dir, 'shampoo_update_percentage_R.png'))
         plt.close()
         
-        # --- 2. 파라미터별 업데이트 빈도 히트맵 ---
-        data = []
-        params = []
-        for name in self.block_update_stats:
-            stats = self.block_update_stats[name]
-            denominator = max(1, stats['total_steps'] / 2)
-            
-            l_freq = stats['L'] / denominator
-            r_freq = stats['R'] / denominator
-            
-            data.append([l_freq, r_freq])
-            params.append(name)
-            
-        if data:
-            df = pd.DataFrame(data, columns=['L (Left)', 'R (Right)'], index=params)
-            plt.figure(figsize=(8, max(10, len(params) * 0.25)))
-            sns.heatmap(df, cmap='YlGnBu', vmin=0, vmax=1, annot=False)
-            plt.title('Preconditioner Update Frequency Heatmap')
-            plt.tight_layout()
-            plt.savefig(os.path.join(self.save_dir, 'shampoo_update_heatmap.png'))
-            plt.close()
+        # --- 2. 파라미터별 업데이트 빈도 히트맵 (가독성 향상을 위한 분할 저장) ---
+        data_rows = []
+        indices = []
+        
+        # Sort parameters for consistent plotting (try numerical sort if possible)
+        sorted_param_names = sorted(
+            self.block_update_stats.keys(), 
+            key=lambda x: int(x.split('.')[0]) if x.split('.')[0].isdigit() else x
+        )
 
-        # --- 3. Epoch별 Eigendecomposition 소요 시간 그래프 (New) ---
+        for name in sorted_param_names:
+            stats = self.block_update_stats[name]
+            
+            l_freq = stats['L_updated'] / stats['L_total'] if stats['L_total'] > 0 else 0.0
+            r_freq = stats['R_updated'] / stats['R_total'] if stats['R_total'] > 0 else 0.0
+            
+            data_rows.append({'L': l_freq, 'R': r_freq})
+            indices.append(name)
+            
+        if data_rows:
+            df = pd.DataFrame(data_rows, index=indices)
+            
+            # Split dataframe into chunks for readability
+            chunk_size = 15  # 한 이미지당 15개 파라미터
+            num_chunks = (len(df) + chunk_size - 1) // chunk_size
+            
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min((i + 1) * chunk_size, len(df))
+                chunk_df = df.iloc[start_idx:end_idx]
+                
+                plt.figure(figsize=(12, 8))
+                sns.heatmap(chunk_df, annot=True, cmap='YlGnBu', vmin=0, vmax=1, fmt='.2f')
+                plt.title(f'Preconditioner Update Frequency (Part {i+1}/{num_chunks})')
+                plt.tight_layout()
+                plt.savefig(os.path.join(self.save_dir, f'shampoo_update_heatmap_part_{i+1}.png'))
+                plt.close()
+
+        # --- 3. Epoch별 Eigendecomposition 소요 시간 그래프 ---
         if self.epoch_eigh_times:
             epochs_t = sorted(self.epoch_eigh_times.keys())
             times = [self.epoch_eigh_times[e] for e in epochs_t]
@@ -308,10 +346,13 @@ class ShampooMonitor:
             plt.savefig(os.path.join(self.save_dir, 'shampoo_eigh_time.png'))
             plt.close()
 
-def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn):
+def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
     """
     ShampooPreconditionerList의 _compute_single_root_inverse 메서드를 
-    Monkey Patch하여 업데이트 여부를 추적합니다.
+    Monkey Patch하여 실제 eigh 호출 여부를 추적하고 로깅합니다.
+    
+    라이브러리 내부에서 DryShampoo 로직이 수행되므로, 
+    여기서는 로직을 재구현하지 않고 eigh 호출 카운트 변화를 통해 업데이트 여부를 판단합니다.
     """
     from optimizers.distributed_shampoo.utils.shampoo_preconditioner_list import ShampooPreconditionerList
     
@@ -324,58 +365,43 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn):
         is_factor_matrix_diagonal,
         factor_matrix_index,
         root,
-        epsilon_value,
+        epsilon_value,  # <--- [FIX] 라이브러리 업데이트 반영: epsilon_value 인자 추가
         kronecker_factors,
         factor_idx
     ):
-        # --- 원본 로직의 "업데이트 결정" 부분 (DryShampoo 로직) ---
-        bias_corrected_factor_matrix = factor_matrix / self._bias_correction2
-        should_update = True
+        # eigh 호출 횟수 스냅샷 (Before)
+        start_eigh_count = eigh_monitor.total_count
         
-        if (self._matrix_root_inv_threshold > 0.0 and
-            kronecker_factors.eigenvectors[factor_idx] is not None):
-            try:
-                # RC_t 계산
-                rc_t = self._compute_relative_condition_number(
-                    bias_corrected_factor_matrix,
-                    kronecker_factors.eigenvectors[factor_idx],
-                    kronecker_factors.eigenvalues[factor_idx],
-                    epsilon_value
-                )
-                
-                # Ratio Factor (alpha) 계산
-                prev_evals = kronecker_factors.eigenvalues[factor_idx]
-                inv_exponent = self._exponent_multiplier / root
-                evals_safe = torch.clamp(prev_evals + epsilon_value, min=1e-16)
-                min_eval = torch.min(evals_safe)
-                spectral_norm = torch.pow(min_eval, -inv_exponent)
-                frob_norm = torch.norm(torch.pow(evals_safe, -inv_exponent))
-                
-                ratio_factor = spectral_norm / frob_norm
-                
-                adjusted_metric = rc_t * ratio_factor
-                
-                if adjusted_metric < self._matrix_root_inv_threshold:
-                    should_update = False
-            except Exception:
-                should_update = True
+        # 원본 메서드 실행 (DryShampoo 로직 내장)
+        result = original_method(
+            self, 
+            factor_matrix, 
+            inv_factor_matrix, 
+            is_factor_matrix_diagonal, 
+            factor_matrix_index, 
+            root, 
+            epsilon_value, # <--- [FIX] 전달
+            kronecker_factors, 
+            factor_idx
+        )
         
-        # --- 모니터링 로깅 ---
+        # eigh 호출 횟수 스냅샷 (After)
+        end_eigh_count = eigh_monitor.total_count
+        
+        # 실제 eigh가 수행되었는지 판단 (Cheap update면 count 증가 안함)
+        performed_eigh = (end_eigh_count > start_eigh_count)
+        
+        # 모니터링 로깅
         try:
             parts = factor_matrix_index.split('.')
             p_idx = parts[0]
             d_idx = int(parts[-1]) # 0 or 1
             epoch = current_epoch_fn()
-            monitor.log_update(epoch, p_idx, d_idx, should_update)
-        except:
+            monitor.log_update(epoch, p_idx, d_idx, performed_eigh)
+        except Exception:
             pass
 
-        if not should_update:
-            return
-
-        # 실제 업데이트 실행 (원본 메서드 호출)
-        return original_method(self, factor_matrix, inv_factor_matrix, is_factor_matrix_diagonal, 
-                               factor_matrix_index, root, epsilon_value, kronecker_factors, factor_idx)
+        return result
 
     ShampooPreconditionerList._compute_single_root_inverse = patched_compute_single_root_inverse
 
@@ -865,7 +891,7 @@ def train(args: argparse.Namespace):
         betas=(args.beta1, args.beta2),
         weight_decay=args.weight_decay,
         **epsilon_config,
-        momentum=False,
+        momentum=0.0,
         use_nadam=False,
         max_preconditioner_dim=args.max_preconditioner_dim,
         precondition_frequency=args.precondition_frequency,
@@ -878,6 +904,7 @@ def train(args: argparse.Namespace):
         distributed_config=distributed_config,
         preconditioner_dtype=torch.float32,
         matrix_root_inv_threshold=args.matrix_root_inv_threshold,
+        max_epsilon=args.max_epsilon
     )
 
     # ========================================
@@ -892,7 +919,7 @@ def train(args: argparse.Namespace):
         return current_epoch_ref['epoch']
         
     # Optimizer Patching
-    patch_shampoo_optimizer(optimizer, monitor, get_current_epoch)
+    patch_shampoo_optimizer(optimizer, monitor, get_current_epoch, eigh_monitor)
 
     # Calculate total Shampoo factors per rank
     total_factor_matrices = count_total_shampoo_factors(optimizer)
@@ -1158,13 +1185,18 @@ def train(args: argparse.Namespace):
                 writer.add_scalar('validation_loss', avg_val_loss, epoch)
                 writer.add_scalar('Shampoo/Eigh_Update_Percentage', update_percentage, epoch)
                 writer.add_scalar('Shampoo/Actual_Eigh_Count', actual_eigh_calls, epoch)
+                
+                # [추가] Epoch Total Time 기록
+                writer.add_scalar('Timing/Epoch_Total', timing_tensors[0].item(), epoch)  
                 writer.add_scalar('Timing/Eigendecomposition', epoch_eigendecomp, epoch)
                 
                 # Feature 1 그래프 데이터 기록
-                if epoch in monitor.epoch_update_stats:
-                    stat = monitor.epoch_update_stats[epoch]
-                    pct = 100.0 * stat['updated'] / stat['total'] if stat['total'] > 0 else 0
-                    writer.add_scalar('Shampoo/Monitor_Update_Percentage', pct, epoch)
+                if epoch in monitor.epoch_stats:
+                    s = monitor.epoch_stats[epoch]
+                    l_pct = 100.0 * s['L_updated'] / s['L_total'] if s['L_total'] > 0 else 0
+                    r_pct = 100.0 * s['R_updated'] / s['R_total'] if s['R_total'] > 0 else 0
+                    writer.add_scalar('Shampoo/Monitor_Update_Percentage_L', l_pct, epoch)
+                    writer.add_scalar('Shampoo/Monitor_Update_Percentage_R', r_pct, epoch)
         
         # Save checkpoint
         if (epoch + 1) % args.save_interval == 0:
@@ -1216,7 +1248,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='ViT-Base Training with Enhanced Shampoo Timing')
     parser.add_argument('--data-path', type=str, required=True, help='Path to cache Hugging Face datasets')
     parser.add_argument('--log-dir', type=str, default='logs', help='Directory for TensorBoard logs')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=90, help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=256, help='Batch size per GPU')
     parser.add_argument('--workers', type=int, default=4, help='Number of data loading workers')
     parser.add_argument('--base-lr', type=float, default=1e-3, help='Base learning rate')
@@ -1227,8 +1259,8 @@ if __name__ == '__main__':
     parser.add_argument('--adam-grafting-beta2', type=float, default=0.99, help='Adam grafting beta2')
     parser.add_argument('--grafting-epsilon', type=float, default=1e-10, help='Grafting epsilon')
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024, help='Max preconditioner dimension')
-    parser.add_argument('--precondition-frequency', type=int, default=10, help='Preconditioning frequency')
-    parser.add_argument('--start-preconditioning-step', type=int, default=10, help='Start preconditioning step')
+    parser.add_argument('--precondition-frequency', type=int, default=1, help='Preconditioning frequency')
+    parser.add_argument('--start-preconditioning-step', type=int, default=1, help='Start preconditioning step')
     parser.add_argument('--mixup', type=float, default=0.2, help='Mixup alpha')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing')
     parser.add_argument('--log-interval', type=int, default=20, help='Logging interval')
@@ -1236,7 +1268,8 @@ if __name__ == '__main__':
     parser.add_argument('--save-dir', type=str, default='checkpoints', help='Checkpoint directory')
     parser.add_argument('--resume', type=str, default='', help='Resume from checkpoint')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.75, help='Matrix root inverse threshold')
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.0, help='Matrix root inverse threshold (Tau)')
+    parser.add_argument('--max-epsilon', type=float, default=1e-06, help='Maximum epsilon value for DryShampoo')
     
     # Epsilon configuration options
     parser.add_argument('--epsilon-preset', type=str, default='default',

@@ -17,19 +17,19 @@ N_GPUS=4
 DATA_PATH="$HOME/.cache/huggingface/datasets"
 
 # TensorBoard 로그 및 모델 체크포인트를 저장할 기본 경로
-OUTPUT_DIR="./training_output_1122"
+OUTPUT_DIR="./training_output_1128"
 
 # Python 스크립트 파일 이름
 SCRIPT_NAME="vit.py"
 
 # 학습 기본 하이퍼파라미터
-EPOCHS=100
+EPOCHS=90
 BATCH_SIZE_PER_GPU=256 # GPU 메모리에 맞춰 조절
 WORKERS=4              # 데이터 로딩에 사용할 CPU 워커 수
 
 # 옵티마이저 및 스케줄러 하이퍼파라미터
 BASE_LR=0.00145
-WARMUP_STEPS=6260
+WARMUP_STEPS=5634
 WEIGHT_DECAY=0.0005
 BETA1=0.95
 

@@ -310,6 +310,22 @@ class ShampooMonitor:
             plt.savefig(os.path.join(self.save_dir, 'epsilon_evolution.png'))
             plt.close()
 
+        # 5. Eigendecomposition Time
+        if self.epoch_eigh_times:
+            eigh_epochs = sorted(self.epoch_eigh_times.keys())
+            times = [self.epoch_eigh_times[e] for e in eigh_epochs]
+            
+            plt.figure(figsize=(10, 6))
+            plt.plot(eigh_epochs, times, marker='*', color='red', linestyle='-')
+            plt.title('Average Eigendecomposition Wall-Clock Time per Epoch')
+            plt.xlabel('Epoch')
+            plt.ylabel('Time (seconds)')
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.save_dir, 'eigh_time_evolution.png'))
+            plt.close()
+
+    
 def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
     """
     ShampooPreconditionerList의 메서드를 Override하여 DryShampoo의 내부 동작을 상세히 기록합니다.
@@ -914,7 +930,7 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=str, default='')
     parser.add_argument('--seed', type=int, default=42)
 
-    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.50)
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.75)
     parser.add_argument('--max-epsilon', type=float, default=1e-06)
 
     parser.add_argument('--epsilon-preset', type=str, default='default', choices=['default', 'asymmetric'])

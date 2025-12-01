@@ -2,26 +2,26 @@
 This is the source code used for the 'DryShampoo' experiment.
 
     optimizer = DistributedShampoo(
-        model.parameters(),
-        lr=args.lr,
+        params=model.parameters(),
+        lr=args.base_lr,
         betas=(args.beta1, args.beta2),
-        epsilon=1e-10,
         weight_decay=args.weight_decay,
+        **epsilon_config,
+        momentum=0.0,
         max_preconditioner_dim=args.max_preconditioner_dim,
         precondition_frequency=args.precondition_frequency,
         start_preconditioning_step=args.start_preconditioning_step,
+        grafting_config=AdamGraftingConfig(beta2=args.adam_grafting_beta2, epsilon=args.grafting_epsilon),
         use_decoupled_weight_decay=True,
         inv_root_override=2,
         exponent_multiplier=1,
-        grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-8),
         distributed_config=distributed_config,
-        use_protected_eigh=True,
-        matrix_root_inv_threshold=0.0
+        preconditioner_dtype=torch.float32,
+        matrix_root_inv_threshold=args.matrix_root_inv_threshold,
+        max_epsilon=args.max_epsilon
     )
 
-The 'matrix_root_inv_threshold' hyperparameter has been added to the existing Shampoo optimizer. 
-
-Max epsilon has been added as a parser argument.
+The 'matrix_root_inv_threshold' and 'max_epsilon' hyperparameters have been added to the existing Shampoo optimizer. 
 
 vit.py: Source code for training ViT + ImageNet using the Distributed Shampoo optimizer. 
 

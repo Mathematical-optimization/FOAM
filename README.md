@@ -23,6 +23,8 @@ This is the source code used for the 'DryShampoo' experiment.
 
 The 'matrix_root_inv_threshold' and 'max_epsilon' hyperparameters have been added to the existing Shampoo optimizer. 
 
+It is recommended to set both hyperparameters ‘start-preconditioning-step’ and ‘precondition-frequency’ of the existing Shampoo optimizer to 1.
+
 vit.py: Source code for training ViT + ImageNet using the Distributed Shampoo optimizer. 
 
 resnet.py: Source code for training Resnet-50 + ImageNet using the Distributed Shampoo optimizer.

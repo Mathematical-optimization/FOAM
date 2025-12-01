@@ -42,6 +42,8 @@ from optimizers.distributed_shampoo.shampoo_types import (
     DDPShampooConfig,
     CommunicationDType
 )
+from optimizers.distributed_shampoo.utils.shampoo_preconditioner_list import ShampooPreconditionerList
+from optimizers.matrix_functions import matrix_inverse_root, check_diagonal
 
 # ========================================
 # Enhanced Wall Clock Time Measurement Classes
@@ -63,13 +65,11 @@ class TimingStats:
     
     def update(self, time_delta: float):
         """새로운 시간 측정값 추가"""
-        # Update cumulative stats
         self.total_time += time_delta
         self.count += 1
         self.min_time = min(self.min_time, time_delta)
         self.max_time = max(self.max_time, time_delta)
         
-        # Update per-epoch stats
         self.epoch_time += time_delta
         self.epoch_count += 1
         self.epoch_min_time = min(self.epoch_min_time, time_delta)
@@ -84,12 +84,10 @@ class TimingStats:
     
     @property
     def avg_time(self) -> float:
-        """평균 시간 계산 (cumulative)"""
         return self.total_time / self.count if self.count > 0 else 0.0
     
     @property
     def epoch_avg_time(self) -> float:
-        """평균 시간 계산 (per-epoch)"""
         return self.epoch_time / self.epoch_count if self.epoch_count > 0 else 0.0
 
 class EnhancedWallClockProfiler:
@@ -104,13 +102,11 @@ class EnhancedWallClockProfiler:
         self.current_epoch = -1
         
     def start_timer(self, name: str):
-        """타이머 시작"""
         if self.use_cuda_sync and torch.cuda.is_available():
             torch.cuda.synchronize()
         self.active_timers[name] = time.perf_counter()
     
     def end_timer(self, name: str) -> float:
-        """타이머 종료 및 시간 반환"""
         if self.use_cuda_sync and torch.cuda.is_available():
             torch.cuda.synchronize()
         
@@ -123,44 +119,35 @@ class EnhancedWallClockProfiler:
         return elapsed
     
     def get_stats(self, name: str) -> TimingStats:
-        """특정 타이머의 통계 반환"""
         return self.timers[name]
     
     def reset_epoch_timers(self, epoch: int):
-        """새로운 에폭 시작 시 에폭별 타이머 리셋"""
         self.current_epoch = epoch
         self.epoch_start_time = time.perf_counter()
         for stats in self.timers.values():
             stats.reset_epoch_stats()
     
     def get_epoch_summary(self) -> Dict[str, Dict[str, float]]:
-        """현재 에폭의 타이밍 요약 반환"""
         summary = {}
         for name, stats in self.timers.items():
             if stats.epoch_count > 0:
                 summary[name] = {
                     'epoch_time': stats.epoch_time,
                     'epoch_avg_time': stats.epoch_avg_time,
-                    'epoch_min_time': stats.epoch_min_time,
-                    'epoch_max_time': stats.epoch_max_time,
                     'epoch_count': stats.epoch_count
                 }
         return summary
     
     def get_cumulative_summary(self) -> Dict[str, Dict[str, float]]:
-        """전체 누적 타이밍 요약 반환"""
         summary = {}
         for name, stats in self.timers.items():
             summary[name] = {
                 'total_time': stats.total_time,
                 'avg_time': stats.avg_time,
-                'min_time': stats.min_time,
-                'max_time': stats.max_time,
                 'count': stats.count
             }
         return summary
 
-# Global profiler instance
 wall_clock_profiler = EnhancedWallClockProfiler(use_cuda_sync=True)
 
 # ========================================
@@ -168,10 +155,6 @@ wall_clock_profiler = EnhancedWallClockProfiler(use_cuda_sync=True)
 # ========================================
 
 class EighMonitor:
-    """
-    torch.linalg.eigh 호출 횟수를 모니터링하는 클래스.
-    에폭별 카운트와 구간별 카운트를 모두 지원합니다.
-    """
     def __init__(self):
         self.epoch_count = 0
         self.total_count = 0
@@ -186,177 +169,151 @@ class EighMonitor:
         self.epoch_count = 0
 
 def count_total_shampoo_factors(optimizer):
-    """옵티마이저가 관리하는 전체 Factor 행렬(L, R)의 개수를 반환합니다."""
     total_count = 0
     if hasattr(optimizer, '_per_group_state_lists'):
         for state_lists in optimizer._per_group_state_lists:
-            # 'shampoo_preconditioner_list' 키 사용
             if 'shampoo_preconditioner_list' in state_lists:
                 preconditioner_list = state_lists['shampoo_preconditioner_list']
-                # 각 파라미터 블록별로 순회
                 for kronecker_factors in preconditioner_list._masked_kronecker_factors_list:
-                    # 각 블록의 Factor 행렬(L, R 등) 개수 더하기
                     total_count += len(kronecker_factors.factor_matrices)
     return total_count
 
 class ShampooMonitor:
-    """Shampoo 업데이트 통계를 수집하고 시각화하는 클래스"""
+    """Shampoo 업데이트 통계 및 DryShampoo 핵심 지표 시각화 클래스"""
     def __init__(self, save_dir, rank):
         self.save_dir = save_dir
         self.rank = rank
         
-        # Feature 1: Epoch별 업데이트 비율 저장 (L, R 분리)
-        # 구조: {epoch: {'L_total': 0, 'L_updated': 0, 'R_total': 0, 'R_updated': 0}}
-        self.epoch_stats = defaultdict(lambda: {
-            'L_updated': 0, 'L_total': 0, 
-            'R_updated': 0, 'R_total': 0
-        })
-        
-        # Feature 2: 파라미터 블록별 누적 업데이트 횟수
-        self.block_update_stats = defaultdict(lambda: {'L_updated': 0, 'L_total': 0, 'R_updated': 0, 'R_total': 0})
-        
-        # Feature 4: Epoch별 Eigendecomposition 시간 저장
+        # 기본 학습 지표
+        self.train_losses = []
+        self.val_losses = []
+        self.val_accuracies = []
+        self.epochs = []
+
+        # DryShampoo 지표
+        self.epoch_stats = defaultdict(lambda: {'L_updated': 0, 'L_total': 0, 'R_updated': 0, 'R_total': 0})
         self.epoch_eigh_times = {}
+        
+        # RC 값 및 Epsilon 분포 (Epoch별 수집)
+        self.rc_history = defaultdict(list)
+        self.epsilon_history = defaultdict(list)
         
         self.param_index_to_name = {}
 
     def register_param_names(self, model, optimizer):
-        """Optimizer의 파라미터 인덱스와 모델의 파라미터 이름을 매핑"""
         optim_params = optimizer.param_groups[0]['params']
         param_id_to_index = {id(p): i for i, p in enumerate(optim_params)}
-        
         for name, param in model.named_parameters():
             if id(param) in param_id_to_index:
                 idx = param_id_to_index[id(param)]
                 self.param_index_to_name[str(idx)] = name
 
-    def log_update(self, epoch, param_idx, dim_idx, updated):
-        """Shampoo 내부에서 호출될 로깅 함수"""
+    def log_metric(self, epoch, train_loss, val_loss, val_acc):
+        """기본 학습 지표 기록 (Full-batch Train Loss 사용)"""
+        if self.rank != 0: return
+        self.epochs.append(epoch)
+        self.train_losses.append(train_loss)
+        self.val_losses.append(val_loss)
+        self.val_accuracies.append(val_acc)
+
+    def log_update(self, epoch, param_idx, dim_idx, updated, rc_value, epsilon_value):
+        """DryShampoo 상태 로깅 (RC, Epsilon 포함)"""
         if self.rank != 0: return
 
-        # dim_idx 0 -> L, 1 -> R
         key_prefix = 'L' if dim_idx == 0 else 'R'
-
-        # Feature 1 Data (Global)
         self.epoch_stats[epoch][f'{key_prefix}_total'] += 1
         if updated:
             self.epoch_stats[epoch][f'{key_prefix}_updated'] += 1
             
-        # Feature 2 Data (Per Block)
-        param_name = self.param_index_to_name.get(str(param_idx), f"param_{param_idx}")
-        
-        self.block_update_stats[param_name][f'{key_prefix}_total'] += 1
-        if updated:
-            self.block_update_stats[param_name][f'{key_prefix}_updated'] += 1
+        if rc_value is not None:
+            self.rc_history[epoch].append(rc_value)
+        if epsilon_value is not None:
+            self.epsilon_history[epoch].append(epsilon_value)
 
     def log_eigh_time(self, epoch, time_sec):
-        """Epoch별 Eigendecomposition 시간 기록 (New)"""
         if self.rank != 0: return
         self.epoch_eigh_times[epoch] = time_sec
 
     def save_plots(self):
         if self.rank != 0: return
-        
         os.makedirs(self.save_dir, exist_ok=True)
 
-        # --- 1. Epoch별 업데이트 비율 그래프 (L/R 분리) ---
-        epochs = sorted(self.epoch_stats.keys())
-        
-        # Plot L
-        l_ratios = []
-        for e in epochs:
-            s = self.epoch_stats[e]
-            ratio = 100.0 * s['L_updated'] / s['L_total'] if s['L_total'] > 0 else 0.0
-            l_ratios.append(ratio)
-            
-        plt.figure(figsize=(10, 6))
-        plt.plot(epochs, l_ratios, marker='o', linestyle='-', color='b')
-        plt.title(f'Shampoo L-Factor Update Percentage per Epoch')
-        plt.xlabel('Epoch')
-        plt.ylabel('Update Percentage (%)')
-        plt.grid(True)
-        plt.savefig(os.path.join(self.save_dir, 'shampoo_update_percentage_L.png'))
-        plt.close()
+        # 1. Loss & Accuracy Curves
+        if self.epochs:
+            plt.figure(figsize=(12, 5))
+            plt.subplot(1, 2, 1)
+            plt.plot(self.epochs, self.train_losses, label='Train Loss (Full-Batch)', marker='.')
+            plt.plot(self.epochs, self.val_losses, label='Val Loss', marker='.')
+            plt.title('Loss Curve')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True)
 
-        # Plot R
-        r_ratios = []
-        for e in epochs:
-            s = self.epoch_stats[e]
-            ratio = 100.0 * s['R_updated'] / s['R_total'] if s['R_total'] > 0 else 0.0
-            r_ratios.append(ratio)
-            
-        plt.figure(figsize=(10, 6))
-        plt.plot(epochs, r_ratios, marker='o', linestyle='-', color='r')
-        plt.title(f'Shampoo R-Factor Update Percentage per Epoch')
-        plt.xlabel('Epoch')
-        plt.ylabel('Update Percentage (%)')
-        plt.grid(True)
-        plt.savefig(os.path.join(self.save_dir, 'shampoo_update_percentage_R.png'))
-        plt.close()
-        
-        # --- 2. 파라미터별 업데이트 빈도 히트맵 (가독성 향상을 위한 분할 저장) ---
-        data_rows = []
-        indices = []
-        
-        # Sort parameters for consistent plotting (try numerical sort if possible)
-        sorted_param_names = sorted(
-            self.block_update_stats.keys(), 
-            key=lambda x: int(x.split('.')[0]) if x.split('.')[0].isdigit() else x
-        )
+            plt.subplot(1, 2, 2)
+            plt.plot(self.epochs, self.val_accuracies, label='Val Accuracy', color='g', marker='.')
+            plt.title('Validation Accuracy')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy (%)')
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.save_dir, 'training_curves.png'))
+            plt.close()
 
-        for name in sorted_param_names:
-            stats = self.block_update_stats[name]
-            
-            l_freq = stats['L_updated'] / stats['L_total'] if stats['L_total'] > 0 else 0.0
-            r_freq = stats['R_updated'] / stats['R_total'] if stats['R_total'] > 0 else 0.0
-            
-            data_rows.append({'L': l_freq, 'R': r_freq})
-            indices.append(name)
-            
-        if data_rows:
-            df = pd.DataFrame(data_rows, index=indices)
-            
-            # Split dataframe into chunks for readability
-            chunk_size = 15  # 한 이미지당 15개 파라미터
-            num_chunks = (len(df) + chunk_size - 1) // chunk_size
-            
-            for i in range(num_chunks):
-                start_idx = i * chunk_size
-                end_idx = min((i + 1) * chunk_size, len(df))
-                chunk_df = df.iloc[start_idx:end_idx]
-                
-                plt.figure(figsize=(12, 8))
-                sns.heatmap(chunk_df, annot=True, cmap='YlGnBu', vmin=0, vmax=1, fmt='.2f')
-                plt.title(f'Preconditioner Update Frequency (Part {i+1}/{num_chunks})')
-                plt.tight_layout()
-                plt.savefig(os.path.join(self.save_dir, f'shampoo_update_heatmap_part_{i+1}.png'))
-                plt.close()
+        # 2. Update Percentage (L/R Combined)
+        if self.epoch_stats:
+            epochs = sorted(self.epoch_stats.keys())
+            l_ratios = [100.0 * self.epoch_stats[e]['L_updated'] / max(1, self.epoch_stats[e]['L_total']) for e in epochs]
+            r_ratios = [100.0 * self.epoch_stats[e]['R_updated'] / max(1, self.epoch_stats[e]['R_total']) for e in epochs]
 
-        # --- 3. Epoch별 Eigendecomposition 소요 시간 그래프 ---
-        if self.epoch_eigh_times:
-            epochs_t = sorted(self.epoch_eigh_times.keys())
-            times = [self.epoch_eigh_times[e] for e in epochs_t]
+            plt.figure(figsize=(10, 6))
+            plt.plot(epochs, l_ratios, label='L-Factor', marker='o')
+            plt.plot(epochs, r_ratios, label='R-Factor', marker='s')
+            plt.title('Preconditioner Update Percentage (Freshness)')
+            plt.xlabel('Epoch')
+            plt.ylabel('Update %')
+            plt.ylim(-5, 105)
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(self.save_dir, 'shampoo_update_percentage.png'))
+            plt.close()
+
+        # 3. RC Distribution Boxplot
+        epochs = sorted(self.rc_history.keys())
+        if self.rc_history:
+            plt.figure(figsize=(12, 6))
+            data = []
+            for e in epochs:
+                if e in self.rc_history:
+                    data.extend([{'Epoch': e, 'RC': val} for val in self.rc_history[e]])
+            
+            if data:
+                df_rc = pd.DataFrame(data)
+                sns.boxplot(x='Epoch', y='RC', data=df_rc, showfliers=False)
+                plt.title('Distribution of Relative Condition (RC) Numbers per Epoch')
+                plt.grid(True, axis='y')
+                plt.savefig(os.path.join(self.save_dir, 'rc_distribution.png'))
+            plt.close()
+
+        # 4. Epsilon Evolution
+        if self.epsilon_history:
+            avg_eps = [sum(self.epsilon_history[e])/len(self.epsilon_history[e]) for e in epochs if e in self.epsilon_history]
+            valid_epochs = [e for e in epochs if e in self.epsilon_history]
             
             plt.figure(figsize=(10, 6))
-            plt.plot(epochs_t, times, marker='o', linestyle='-', color='r')
-            plt.title('Eigendecomposition Wall-clock Time per Epoch')
+            plt.plot(valid_epochs, avg_eps, marker='^', color='purple')
+            plt.title('Average Adaptive Epsilon per Epoch')
             plt.xlabel('Epoch')
-            plt.ylabel('Time (seconds)')
+            plt.ylabel('Epsilon')
+            plt.yscale('log')
             plt.grid(True)
-            plt.savefig(os.path.join(self.save_dir, 'shampoo_eigh_time.png'))
+            plt.savefig(os.path.join(self.save_dir, 'epsilon_evolution.png'))
             plt.close()
 
 def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
     """
-    ShampooPreconditionerList의 _compute_single_root_inverse 메서드를 
-    Monkey Patch하여 실제 eigh 호출 여부를 추적하고 로깅합니다.
-    
-    라이브러리 내부에서 DryShampoo 로직이 수행되므로, 
-    여기서는 로직을 재구현하지 않고 eigh 호출 카운트 변화를 통해 업데이트 여부를 판단합니다.
+    ShampooPreconditionerList의 메서드를 Override하여 DryShampoo의 내부 동작을 상세히 기록합니다.
     """
-    from optimizers.distributed_shampoo.utils.shampoo_preconditioner_list import ShampooPreconditionerList
-    
-    original_method = ShampooPreconditionerList._compute_single_root_inverse
 
     def patched_compute_single_root_inverse(
         self,
@@ -365,52 +322,110 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
         is_factor_matrix_diagonal,
         factor_matrix_index,
         root,
-        epsilon_value,  # <--- [FIX] 라이브러리 업데이트 반영: epsilon_value 인자 추가
+        epsilon_value,
         kronecker_factors,
         factor_idx
     ):
-        # eigh 호출 횟수 스냅샷 (Before)
         start_eigh_count = eigh_monitor.total_count
         
-        # 원본 메서드 실행 (DryShampoo 로직 내장)
-        result = original_method(
-            self, 
-            factor_matrix, 
-            inv_factor_matrix, 
-            is_factor_matrix_diagonal, 
-            factor_matrix_index, 
-            root, 
-            epsilon_value, # <--- [FIX] 전달
-            kronecker_factors, 
-            factor_idx
-        )
+        bias_corrected_factor_matrix = factor_matrix / self._bias_correction2
+        prev_Q = kronecker_factors.eigenvectors[factor_idx]
+        prev_D = kronecker_factors.eigenvalues[factor_idx]
         
-        # eigh 호출 횟수 스냅샷 (After)
+        current_epsilon = kronecker_factors.adaptive_epsilons[factor_idx]
+        if current_epsilon is None:
+            current_epsilon = epsilon_value
+
+        should_recompute_eigen = True
+        rc_val_to_log = None 
+
+        if prev_Q is not None and prev_D is not None and self._matrix_root_inv_threshold > 0.0:
+            try:
+                rc_t = self._compute_relative_condition_number(
+                    bias_corrected_factor_matrix, prev_Q, prev_D, current_epsilon
+                )
+                rc_val_to_log = rc_t.item()
+
+                new_epsilon = current_epsilon * (rc_t / self._matrix_root_inv_threshold)
+                
+                if rc_t >= self._matrix_root_inv_threshold:
+                    if new_epsilon < self._max_epsilon:
+                        current_epsilon = float(new_epsilon)
+                        should_recompute_eigen = False
+                        
+                        alpha = -self._exponent_multiplier / root
+                        eig_term = (prev_D + current_epsilon).pow(alpha)
+                        computed_inv_factor_matrix = prev_Q * eig_term.unsqueeze(0) @ prev_Q.T
+                        
+                        computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype=inv_factor_matrix.dtype)
+                        inv_factor_matrix.copy_(computed_inv_factor_matrix)
+                        kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon
+                    else:
+                        current_epsilon = epsilon_value
+                        should_recompute_eigen = True 
+                else:
+                    current_epsilon = float(new_epsilon)
+                    should_recompute_eigen = False
+                    
+                    alpha = -self._exponent_multiplier / root
+                    eig_term = (prev_D + current_epsilon).pow(alpha)
+                    computed_inv_factor_matrix = prev_Q * eig_term.unsqueeze(0) @ prev_Q.T
+                    
+                    computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype=inv_factor_matrix.dtype)
+                    inv_factor_matrix.copy_(computed_inv_factor_matrix)
+                    kronecker_factors.adaptive_eps_epsilons[factor_idx] = current_epsilon
+                    
+            except Exception:
+                should_recompute_eigen = True
+
+        if should_recompute_eigen:
+            if is_factor_matrix_diagonal and not check_diagonal(factor_matrix):
+                is_factor_matrix_diagonal.copy_(torch.tensor(False))
+
+            try:
+                result = matrix_inverse_root(
+                    A=bias_corrected_factor_matrix,
+                    root=root,
+                    epsilon=current_epsilon,
+                    exponent_multiplier=self._exponent_multiplier,
+                    is_diagonal=is_factor_matrix_diagonal,
+                    retry_double_precision=self._use_protected_eigh,
+                )
+                
+                computed_inv_factor_matrix, _, L, Q = result
+                
+                if L is not None and Q is not None:
+                    kronecker_factors.eigenvalues[factor_idx] = L.to(dtype=factor_matrix.dtype)
+                    kronecker_factors.eigenvectors[factor_idx] = Q.to(dtype=factor_matrix.dtype)
+                    kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon
+                
+                computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype=inv_factor_matrix.dtype)
+                inv_factor_matrix.copy_(computed_inv_factor_matrix)
+
+            except Exception:
+                pass
+
         end_eigh_count = eigh_monitor.total_count
-        
-        # 실제 eigh가 수행되었는지 판단 (Cheap update면 count 증가 안함)
         performed_eigh = (end_eigh_count > start_eigh_count)
         
-        # 모니터링 로깅
         try:
             parts = factor_matrix_index.split('.')
             p_idx = parts[0]
-            d_idx = int(parts[-1]) # 0 or 1
+            d_idx = int(parts[-1])
             epoch = current_epoch_fn()
-            monitor.log_update(epoch, p_idx, d_idx, performed_eigh)
+            monitor.log_update(epoch, p_idx, d_idx, performed_eigh, rc_val_to_log, current_epsilon)
         except Exception:
             pass
-
-        return result
 
     ShampooPreconditionerList._compute_single_root_inverse = patched_compute_single_root_inverse
 
 def validate_on_trainset(model, train_loader, criterion, device, rank, world_size):
-    """Full-batch training loss 계산 (Feature 3)"""
+    """Full-batch training loss 계산 (에폭 전체 데이터 사용)"""
     model.eval()
     running_loss = 0.0
     num_batches = 0
     
+    # 훈련 셋 전체를 평가 모드로 순회
     with torch.no_grad():
         for batch in train_loader:
             if isinstance(batch, dict):
@@ -444,45 +459,6 @@ def validate_on_trainset(model, train_loader, criterion, device, rank, world_siz
 # ViT Model Components
 # ========================================
 
-def set_seed(seed : int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        os.environ['PYTHONHASHSEED'] = str(seed)
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
-
-def set_seed_distributed(seed: int = 42, rank: int = 0):
-    rank_seed = seed + rank
-    random.seed(rank_seed)
-    np.random.seed(rank_seed)
-    torch.manual_seed(rank_seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(rank_seed)
-        torch.cuda.manual_seed_all(rank_seed)
-    os.environ['PYTHONHASHSEED'] = str(rank_seed)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
-    print(f"Rank {rank}: Seed set to {rank_seed} (base seed: {seed})")
-
-class EighFallbackCounter(logging.Handler):
-    """'eigh' 연산이 float64로 재시도될 때 발생하는 경고를 카운트합니다."""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.count = 0
-        self.setLevel(logging.WARNING)
-
-    def emit(self, record):
-        try:
-            message = record.getMessage()
-            if "Retrying in double precision" in message:
-                self.count += 1
-        except Exception:
-            self.handleError(record)
-
 class MLPBlock(nn.Module):
     def __init__(self, embedding_dim: int, mlp_dim: int, dropout: float = 0.1):
         super().__init__()
@@ -495,7 +471,6 @@ class MLPBlock(nn.Module):
         return self.dropout(self.fc2(self.dropout(self.act(self.fc1(x)))))
 
 class CustomMultiheadAttention(nn.Module):
-    """Q, K, V가 분리된 커스텀 Multi-Head Attention 모듈"""
     def __init__(self, embedding_dim: int = 384, num_heads: int = 6, attn_dropout: float = 0.0):
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -582,109 +557,46 @@ class VisionTransformer(nn.Module):
 # Utility Functions
 # ========================================
 
-def validate_checkpoint_completeness(optimizer_state, model):
-    """체크포인트가 모든 필요한 정보를 포함하는지 검증"""
-    expected_qkv_params = 0
-    found_qkv_factor_matrices = 0
-    
-    for name, param in model.named_parameters():
-        if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj']) and 'weight' in name:
-            expected_qkv_params += 1
-            if name in optimizer_state['state']:
-                param_state = optimizer_state['state'][name]
-                for key in param_state:
-                    if isinstance(key, str) and 'factor_matrices' in key:
-                        if isinstance(param_state[key], torch.Tensor) and param_state[key].numel() > 0:
-                            found_qkv_factor_matrices += 1
-    
-    print(f"\n=== 체크포인트 완전성 검증 ===")
-    print(f"예상 Q/K/V 파라미터 수: {expected_qkv_params}")
-    print(f"Factor matrices를 가진 Q/K/V 파라미터: {found_qkv_factor_matrices // 2}")
-    
-    if found_qkv_factor_matrices < expected_qkv_params * 2:
-        print("⚠️  경고: 일부 factor matrices가 누락되었을 수 있습니다!")
-    else:
-        print("✅ 모든 factor matrices가 정상적으로 수집되었습니다.")
-
 def gather_optimizer_state_from_all_ranks(optimizer, model, global_rank, world_size):
-    """모든 랭크에서 옵티마이저 상태를 수집하고 통합합니다."""
     local_state = optimizer.distributed_state_dict(
         key_to_param=model.module.named_parameters()
     )
-    
     all_states = [None] * world_size
     dist.all_gather_object(all_states, local_state)
     
     if global_rank == 0:
         merged_state = {'state': {}, 'param_groups': all_states[0].get('param_groups', [])}
-        
         for param_key in all_states[0]['state'].keys():
             merged_state['state'][param_key] = {}
-            
             param_state_keys = set()
-            
             for state in all_states:
                 if 'state' in state and param_key in state['state']:
                     param_state_keys.update(state['state'][param_key].keys())
             
             for state_key in param_state_keys:
                 merged_value = None
-                is_factor_matrix = False
-                
-                if isinstance(state_key, str) and 'factor_matrices' in state_key:
-                    is_factor_matrix = True
-                
+                is_factor_matrix = 'factor_matrices' in str(state_key)
                 for rank, state in enumerate(all_states):
-                    if ('state' in state and 
-                        param_key in state['state'] and 
+                    if ('state' in state and param_key in state['state'] and 
                         state_key in state['state'][param_key]):
-                        
                         value = state['state'][param_key][state_key]
-                        
                         if isinstance(value, torch.Tensor):
-                            if hasattr(value, '_local_tensor'):
-                                value = value._local_tensor
-                            
+                            if hasattr(value, '_local_tensor'): value = value._local_tensor
                             if is_factor_matrix:
                                 if value.numel() > 0:
-                                    if merged_value is None:
-                                        merged_value = value.clone()
-                                    elif merged_value.numel() == 0:
-                                        merged_value = value.clone()
+                                    if merged_value is None: merged_value = value.clone()
+                                    elif merged_value.numel() == 0: merged_value = value.clone()
                             else:
                                 if merged_value is None or (merged_value.numel() == 0 and value.numel() > 0):
                                     merged_value = value.clone()
                         else:
-                            if merged_value is None:
-                                merged_value = value
-                
+                            if merged_value is None: merged_value = value
                 if merged_value is not None:
                     merged_state['state'][param_key][state_key] = merged_value
-        
-        print("\n=== Factor Matrices 수집 검증 ===")
-        total_factor_matrices = 0
-        non_empty_factor_matrices = 0
-        qkv_factor_matrices = 0
-        
-        for param_key, param_state in merged_state['state'].items():
-            for state_key, value in param_state.items():
-                if isinstance(state_key, str) and 'factor_matrices' in state_key:
-                    total_factor_matrices += 1
-                    if isinstance(value, torch.Tensor) and value.numel() > 0:
-                        non_empty_factor_matrices += 1
-                        if any(proj in param_key for proj in ['q_proj', 'k_proj', 'v_proj']):
-                            qkv_factor_matrices += 1
-        
-        print(f"총 Factor Matrices: {total_factor_matrices}")
-        print(f"비어있지 않은 Factor Matrices: {non_empty_factor_matrices}")
-        print(f"Q/K/V Projection의 Factor Matrices: {qkv_factor_matrices}")
-        
         return merged_state
-    
     return None
 
 def get_warmup_cosine_decay_lr(current_step: int, base_lr: float, num_steps: int, warmup_steps: int) -> float:
-    """Warmup + Cosine Decay 학습률 스케줄러"""
     if current_step < warmup_steps:
         return base_lr * (current_step / warmup_steps)
     else:
@@ -693,24 +605,18 @@ def get_warmup_cosine_decay_lr(current_step: int, base_lr: float, num_steps: int
         return base_lr * cosine_decay
 
 def setup():
-    """분산 학습 초기화"""
     dist.init_process_group(backend="nccl", init_method="env://")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     
 def cleanup():
-    """분산 학습 종료"""
     dist.destroy_process_group()
 
 def apply_transforms(examples: Dict[str, List[Image.Image]], transform) -> Dict[str, List[torch.Tensor]]:
-    """데이터셋에 변환 적용"""
     examples['pixel_values'] = [transform(image.convert("RGB")) for image in examples['image']]
     return examples
 
 def get_epsilon_config(args):
-    """Epsilon 설정을 프리셋 또는 커스텀 값으로부터 생성"""
-    config = {}
-    
     presets = {
         'default': {
             'epsilon': 1e-08,
@@ -726,28 +632,36 @@ def get_epsilon_config(args):
             'use_adaptive_epsilon': False,
             'condition_thresholds': None
         },
-        'adaptive': {
-            'epsilon': 1e-10,
-            'epsilon_left': None,
-            'epsilon_right': None,
-            'use_adaptive_epsilon': True,
-            'condition_thresholds': {1e6: 1e-5, 1e8: 1e-4}
-        }
     }
-    
     if args.epsilon_preset in presets:
-        config = presets[args.epsilon_preset]
+        return presets[args.epsilon_preset]
     else:
-        config = presets['default']
-        if args.epsilon is not None:
-            config['epsilon'] = args.epsilon
-        if args.epsilon_left is not None:
-            config['epsilon_left'] = args.epsilon_left
-        if args.epsilon_right is not None:
-            config['epsilon_right'] = args.epsilon_right
-        config['use_adaptive_epsilon'] = args.use_adaptive_epsilon
-    
-    return config
+        # Fallback for manual config
+        config = {'epsilon': 1e-08, 'epsilon_left': None, 'epsilon_right': None, 'use_adaptive_epsilon': False}
+        if args.epsilon is not None: config['epsilon'] = args.epsilon
+        return config
+
+class EighFallbackCounter(logging.Handler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.count = 0
+        self.setLevel(logging.WARNING)
+    def emit(self, record):
+        try:
+            if "Retrying in double precision" in record.getMessage(): self.count += 1
+        except Exception: self.handleError(record)
+
+def set_seed_distributed(seed: int = 42, rank: int = 0):
+    rank_seed = seed + rank
+    random.seed(rank_seed)
+    np.random.seed(rank_seed)
+    torch.manual_seed(rank_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(rank_seed)
+        torch.cuda.manual_seed_all(rank_seed)
+    os.environ['PYTHONHASHSEED'] = str(rank_seed)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
 
 # ========================================
 # Main Training Function
@@ -761,124 +675,85 @@ def train(args: argparse.Namespace):
 
     set_seed_distributed(seed = args.seed, rank = global_rank)
     
-    print(f"Running DDP training. Global Rank: {global_rank}, Local Rank: {local_rank}, World Size: {world_size}")
+    if global_rank == 0:
+        print(f"Running DDP training. Global Rank: {global_rank}, Local Rank: {local_rank}, World Size: {world_size}")
 
     writer = SummaryWriter(log_dir=args.log_dir) if global_rank == 0 else None
-    
-    # Start total training timer
     wall_clock_profiler.training_start_time = time.perf_counter()
     
     def seed_worker(worker_id):
-        worker_seed = torch.initial_seed()
-        np_seed = worker_seed % (2**32)
-        np.random.seed(np_seed)
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
         random.seed(worker_seed)
 
-    # 데이터 변환 설정
     train_transform = create_transform(
         input_size=224,
         is_training=True,
         auto_augment='rand-m15-n2-mstd0.5',
         interpolation='bicubic',
     )
-
     val_transform = create_transform(
         input_size=224,
         is_training=False,
         interpolation='bicubic',
     )
 
-    # Mixup 설정
     mixup_fn = None
     if args.mixup > 0 or args.label_smoothing > 0:
-        mixup_args = {
-            'mixup_alpha': args.mixup,
-            'cutmix_alpha': 0.0,
-            'label_smoothing': args.label_smoothing,
-            'num_classes': 1000
-        }
-        mixup_fn = Mixup(**mixup_args)
+        mixup_fn = Mixup(mixup_alpha=args.mixup, cutmix_alpha=0.0, label_smoothing=args.label_smoothing, num_classes=1000)
 
-    # 데이터셋 로드
     if global_rank == 0:
-        print("Hugging Face Hub에서 ImageNet-1k 데이터셋을 다운로드 및 캐싱합니다...")
         load_dataset("imagenet-1k", cache_dir=args.data_path)
     dist.barrier()
 
-    print(f"Rank {global_rank}에서 캐시된 ImageNet-1k 데이터셋을 로딩합니다...")
     dataset = load_dataset("imagenet-1k", cache_dir=args.data_path)
-
     train_dataset = dataset['train']
     train_dataset.set_transform(functools.partial(apply_transforms, transform=train_transform))
-    
     val_dataset = dataset['validation']
     val_dataset.set_transform(functools.partial(apply_transforms, transform=val_transform))
     
-    def collate_fn(batch: List[Dict[str, any]]) -> Dict[str, torch.Tensor]:
+    def collate_fn(batch):
         return {
             'pixel_values': torch.stack([x['pixel_values'] for x in batch]),
             'label': torch.tensor([x['label'] for x in batch], dtype=torch.long)
         }
 
-    # DataLoader 설정
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True, seed= args.seed)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True, seed=args.seed)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, 
                              num_workers=args.workers, pin_memory=True, collate_fn=collate_fn, 
-                             worker_init_fn = seed_worker, generator = torch.Generator().manual_seed(args.seed))
+                             worker_init_fn=seed_worker, generator=torch.Generator().manual_seed(args.seed))
     
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False, seed = args.seed)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, 
                            num_workers=args.workers, pin_memory=True, collate_fn=collate_fn, 
-                           worker_init_fn = seed_worker, generator = torch.Generator().manual_seed(args.seed))
+                           worker_init_fn=seed_worker, generator=torch.Generator().manual_seed(args.seed))
 
-    torch.manual_seed(args.seed)
-
-    # 모델 설정
-    vit_params = {
-        'img_size': 224, 'patch_size': 16, 'embedding_dim': 384, 'depth': 12,
-        'num_heads': 6, 'mlp_dim': 1536, 'num_classes': 1000
-    }
-    # 모델 생성
-    model = VisionTransformer(**vit_params).to(local_rank)
-    
-    # 모델 크기 정보 출력
+    model = VisionTransformer(img_size=224, patch_size=16, embedding_dim=384, depth=12,
+                              num_heads=6, mlp_dim=1536, num_classes=1000).to(local_rank)
     model = DDP(model, device_ids=[local_rank])
-
-    # 손실 함수
     criterion = nn.CrossEntropyLoss().to(local_rank)
+    
     epsilon_config = get_epsilon_config(args)
 
-    # Initialize Eigh Monitor
     eigh_monitor = EighMonitor()
     eigh_monitor.original_eigh = torch.linalg.eigh
-
-    # Combined Wrapper: Monitor (Count) + Profiler (Time)
     def monitored_timed_eigh(A, UPLO='L', *, out=None):
         wall_clock_profiler.start_timer("eigendecomposition")
         try:
-            result = eigh_monitor.eigh_wrapper(A, UPLO, out=out)
+            return eigh_monitor.eigh_wrapper(A, UPLO, out=out)
         finally:
             wall_clock_profiler.end_timer("eigendecomposition")
-        return result
-    
     torch.linalg.eigh = monitored_timed_eigh
-    
-    if global_rank == 0:
-        print("torch.linalg.eigh has been patched for timing measurement and call counting.")
 
-    # Monkey-patch Shampoo compute_root_inverse for timing
     from optimizers.distributed_shampoo.utils.shampoo_preconditioner_list import ShampooPreconditionerList
     original_compute_root_inverse = ShampooPreconditionerList.compute_root_inverse
-    
     def timed_compute_root_inverse_wrapper(self):
         wall_clock_profiler.start_timer("compute_root_inverse_total")
-        result = original_compute_root_inverse(self)
+        res = original_compute_root_inverse(self)
         wall_clock_profiler.end_timer("compute_root_inverse_total")
-        return result
-    
+        return res
     ShampooPreconditionerList.compute_root_inverse = timed_compute_root_inverse_wrapper
 
-    # 옵티마이저 설정
     distributed_config = DDPShampooConfig(
         communication_dtype=CommunicationDType.FP32,
         num_trainers_per_group=world_size,
@@ -892,12 +767,10 @@ def train(args: argparse.Namespace):
         weight_decay=args.weight_decay,
         **epsilon_config,
         momentum=0.0,
-        use_nadam=False,
         max_preconditioner_dim=args.max_preconditioner_dim,
         precondition_frequency=args.precondition_frequency,
         start_preconditioning_step=args.start_preconditioning_step,
         grafting_config=AdamGraftingConfig(beta2=args.adam_grafting_beta2, epsilon=args.grafting_epsilon),
-        use_normalized_grafting=False,
         use_decoupled_weight_decay=True,
         inv_root_override=2,
         exponent_multiplier=1,
@@ -907,231 +780,75 @@ def train(args: argparse.Namespace):
         max_epsilon=args.max_epsilon
     )
 
-    # ========================================
-    # Feature 1 & 2: Monitor Initialization
-    # ========================================
     monitor = ShampooMonitor(save_dir=args.log_dir, rank=global_rank)
     monitor.register_param_names(model, optimizer)
-    
-    # 현재 Epoch을 캡처하기 위한 참조 객체
     current_epoch_ref = {'epoch': 0}
-    def get_current_epoch():
-        return current_epoch_ref['epoch']
-        
-    # Optimizer Patching
-    patch_shampoo_optimizer(optimizer, monitor, get_current_epoch, eigh_monitor)
+    patch_shampoo_optimizer(optimizer, monitor, lambda: current_epoch_ref['epoch'], eigh_monitor)
 
-    # Calculate total Shampoo factors per rank
-    total_factor_matrices = count_total_shampoo_factors(optimizer)
-    if global_rank == 0:
-        print(f"Total Shampoo Factor Matrices per Rank: {total_factor_matrices}")
-
-    # Eigh Fallback Counter 설정
-    start_epoch = 0
-    cumulative_fallback_count = 0
-    
     eigh_fallback_handler = EighFallbackCounter()
     matrix_logger = logging.getLogger('optimizers.matrix_functions')
     matrix_logger.setLevel(logging.WARNING)
     matrix_logger.addHandler(eigh_fallback_handler)
 
-    # 체크포인트 로드
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print(f"=> loading checkpoint '{args.resume}'")
-            checkpoint = torch.load(args.resume, map_location=f'cuda:{local_rank}')
-            
-            if 'model_state_dict' in checkpoint:
-                model.module.load_state_dict(checkpoint['model_state_dict'])
-            
-            if 'optimizer_state_dict' in checkpoint:
-                try:
-                    optimizer.load_distributed_state_dict(
-                        checkpoint['optimizer_state_dict'],
-                        key_to_param=model.module.named_parameters()
-                    )
-                    print("=> loaded optimizer state")
-                except Exception as e:
-                    print(f"Error loading optimizer state: {e}")
-            
-            if 'epoch' in checkpoint:
-                start_epoch = checkpoint['epoch'] + 1
-            
-            if 'cumulative_fallback_count' in checkpoint:
-                cumulative_fallback_count = checkpoint['cumulative_fallback_count']
+    start_epoch = 0
+    if args.resume and os.path.isfile(args.resume):
+        print(f"=> loading checkpoint '{args.resume}'")
+        checkpoint = torch.load(args.resume, map_location=f'cuda:{local_rank}')
+        model.module.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_distributed_state_dict(checkpoint['optimizer_state_dict'], key_to_param=model.module.named_parameters())
+        start_epoch = checkpoint['epoch'] + 1
 
     total_steps = len(train_loader) * args.epochs
     
-    # Training loop with enhanced timing
     for epoch in range(start_epoch, args.epochs):
-        current_epoch_ref['epoch'] = epoch # Update epoch for monitor
-        
-        # Reset per-epoch timing and counting stats
+        current_epoch_ref['epoch'] = epoch
         wall_clock_profiler.reset_epoch_timers(epoch)
         eigh_monitor.reset_epoch()
-        update_events_in_epoch = 0
         
         epoch_start_time = time.perf_counter()
-        
         train_sampler.set_epoch(epoch)
         eigh_fallback_handler.count = 0
-        
         model.train()
-        running_loss = 0.0
-        
-        # Epoch-level timing stats
-        epoch_forward_time = 0.0
-        epoch_backward_time = 0.0
-        epoch_optimizer_time = 0.0
-        epoch_data_loading_time = 0.0
-        
-        batch_start_time = time.perf_counter()
         
         for i, batch in enumerate(train_loader):
-            # Data loading time
-            data_loading_time = time.perf_counter() - batch_start_time
-            epoch_data_loading_time += data_loading_time
-            
             current_step = epoch * len(train_loader) + i
-            
-            # Track Shampoo Update Events
-            current_global_step_for_shampoo = current_step + 1
-            if (current_global_step_for_shampoo >= args.start_preconditioning_step and 
-                current_global_step_for_shampoo % args.precondition_frequency == 0):
-                update_events_in_epoch += 1
+            images = batch['pixel_values'].to(local_rank, non_blocking=True)
+            labels = batch['label'].to(local_rank, non_blocking=True)
+            if mixup_fn: images, labels = mixup_fn(images, labels)
 
-            if isinstance(batch, dict):
-                images = batch['pixel_values'].to(local_rank, non_blocking=True)
-                labels = batch['label'].to(local_rank, non_blocking=True)
-            else:
-                images, labels = batch
-                images = images.to(local_rank, non_blocking=True)
-                labels = labels.to(local_rank, non_blocking=True)
-            
-            if mixup_fn is not None:
-                images, labels = mixup_fn(images, labels)
-
-            # 학습률 스케줄링
             new_lr = get_warmup_cosine_decay_lr(current_step, args.base_lr, total_steps, args.warmup_steps)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = new_lr
+            for param_group in optimizer.param_groups: param_group['lr'] = new_lr
 
-            # Forward pass timing
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            forward_start = time.perf_counter()
-            
             optimizer.zero_grad()
             outputs = model(images)
             loss = criterion(outputs, labels)
-            
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            forward_time = time.perf_counter() - forward_start
-            epoch_forward_time += forward_time
-            
-            # Backward pass timing
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            backward_start = time.perf_counter()
-            
             loss.backward()
-            
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            backward_time = time.perf_counter() - backward_start
-            epoch_backward_time += backward_time
-            
-            # Optimizer step timing
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            optimizer_start = time.perf_counter()
-            
             optimizer.step()
             
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            optimizer_time = time.perf_counter() - optimizer_start
-            epoch_optimizer_time += optimizer_time
-            
-            running_loss += loss.item()
-            
             if global_rank == 0 and (i + 1) % args.log_interval == 0:
-                print(f"Epoch [{epoch+1}/{args.epochs}], Step [{i+1}/{len(train_loader)}], "
-                      f"LR: {new_lr:.6f}, Loss: {loss.item():.4f}")
-                
-                if writer:
-                    writer.add_scalar('learning_rate', new_lr, current_step)
-            
-            batch_start_time = time.perf_counter()
-        
-        # Epoch timing summary
-        epoch_total_time = time.perf_counter() - epoch_start_time
-        
-        # Get epoch-specific stats from profiler
-        eigendecomp_stats = wall_clock_profiler.get_stats("eigendecomposition")
-        root_inv_stats = wall_clock_profiler.get_stats("compute_root_inverse_total")
-        
-        # Gather timing stats across all ranks
-        timing_tensors = torch.tensor([
-            epoch_total_time,
-            epoch_forward_time,
-            epoch_backward_time, 
-            epoch_optimizer_time,
-            epoch_data_loading_time,
-            eigendecomp_stats.epoch_time,
-            root_inv_stats.epoch_time,
-            eigendecomp_stats.total_time,
-            root_inv_stats.total_time
-        ]).to(local_rank)
-        
-        dist.all_reduce(timing_tensors, op=dist.ReduceOp.SUM)
-        timing_tensors /= world_size
-        
-        # 에폭별 Fallback 카운트 집계
-        local_fallback_count = torch.tensor(eigh_fallback_handler.count).to(local_rank)
-        epoch_fallback_count = local_fallback_count.clone()
-        dist.all_reduce(epoch_fallback_count, op=dist.ReduceOp.SUM)
-        cumulative_fallback_count += epoch_fallback_count.item()
-        
-        # 학습 손실 집계
-        total_loss_tensor = torch.tensor(running_loss).to(local_rank)
-        dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
-        avg_epoch_loss = total_loss_tensor.item() / world_size / len(train_loader)
-        
-        # Feature 4: epoch_eigendecomp 시간 로깅
-        epoch_eigendecomp = timing_tensors[5].item() # Eigendecomposition time
-        if global_rank == 0:
-            monitor.log_eigh_time(epoch, epoch_eigendecomp)
+                print(f"Epoch [{epoch+1}/{args.epochs}] Step [{i+1}/{len(train_loader)}] Loss: {loss.item():.4f}")
 
-        # ========================================
-        # Feature 3: Full-batch Training Loss
-        # ========================================
+        # Feature 4: Eigh Time Logging
+        epoch_eigendecomp_time = wall_clock_profiler.get_stats("eigendecomposition").epoch_time
+        dist_eigh_time = torch.tensor(epoch_eigendecomp_time).to(local_rank)
+        dist.all_reduce(dist_eigh_time, op=dist.ReduceOp.SUM)
+        avg_eigh_time = dist_eigh_time.item() / world_size
+        if global_rank == 0:
+            monitor.log_eigh_time(epoch, avg_eigh_time)
+
+        # Feature 3: Full-batch Training Loss Calculation
         if global_rank == 0:
             print(f"Calculating Full-batch Training Loss for Epoch {epoch+1}...")
         
-        full_train_loss = validate_on_trainset(
-            model, train_loader, criterion, local_rank, global_rank, world_size
-        )
+        full_train_loss = validate_on_trainset(model, train_loader, criterion, local_rank, global_rank, world_size)
         
         # Validation
-        val_start_time = time.perf_counter()
         model.eval()
-        correct = 0 
-        total = 0
-        val_loss_sum = 0.0
-        num_batches = len(val_loader)
-
+        correct = 0; total = 0; val_loss_sum = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                if isinstance(batch, dict):
-                    images = batch['pixel_values'].to(local_rank, non_blocking=True)
-                    labels = batch['label'].to(local_rank, non_blocking=True)
-                else:
-                    images, labels = batch
-                    images = images.to(local_rank, non_blocking=True)
-                    labels = labels.to(local_rank, non_blocking=True)
-                    
+                images = batch['pixel_values'].to(local_rank, non_blocking=True)
+                labels = batch['label'].to(local_rank, non_blocking=True)
                 outputs = model(images)
                 loss = criterion(outputs, labels)
                 val_loss_sum += loss.item()
@@ -1139,151 +856,74 @@ def train(args: argparse.Namespace):
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
-        val_time = time.perf_counter() - val_start_time
+        total_t = torch.tensor(total).to(local_rank)
+        correct_t = torch.tensor(correct).to(local_rank)
+        val_loss_t = torch.tensor(val_loss_sum).to(local_rank)
+        dist.all_reduce(total_t); dist.all_reduce(correct_t); dist.all_reduce(val_loss_t)
         
-        # Validation 결과 집계
-        total_tensor = torch.tensor(total).to(local_rank)
-        correct_tensor = torch.tensor(correct).to(local_rank)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-        
-        local_avg_loss = val_loss_sum / num_batches if num_batches > 0 else 0.0
-        avg_loss_tensor = torch.tensor(local_avg_loss).to(local_rank)
-        dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.SUM)
-        
-        avg_val_loss = avg_loss_tensor.item() / world_size
-        accuracy = 100 * correct_tensor.item() / total_tensor.item() if total_tensor.item() > 0 else 0.0
+        val_acc = 100 * correct_t.item() / total_t.item() if total_t.item() > 0 else 0.0
+        avg_val_loss = val_loss_t.item() / world_size / len(val_loader)
 
-        # Calculate total elapsed time
-        total_elapsed = time.perf_counter() - wall_clock_profiler.training_start_time
-        
-        # Shampoo Update Percentage Calculation
-        actual_eigh_calls = eigh_monitor.epoch_count
-        max_possible_calls = update_events_in_epoch * total_factor_matrices
-        update_percentage = (actual_eigh_calls / max_possible_calls * 100.0) if max_possible_calls > 0 else 0.0
-
-        # Enhanced results output
         if global_rank == 0:
-            print(f"\n{'='*80}")
-            print(f"Epoch [{epoch+1}/{args.epochs}] Summary:")
-            print(f"  Training Loss (Running Avg): {avg_epoch_loss:.4f}")
-            print(f"  Training Loss (Full Batch):  {full_train_loss:.4f}")
-            print(f"  Validation Accuracy: {accuracy:.2f}%")
-            print(f"  Validation Loss: {avg_val_loss:.4f}")
-            
-            # Epoch-level timing
-            print(f"\nTiming Statistics for this Epoch (Averaged across {world_size} GPUs):")
-            print(f"  Epoch Total Time: {timing_tensors[0].item():.2f}s")
-            
-            # Shampoo Update Stats
-            print(f"\nShampoo Update Statistics:")
-            print(f"  - Update Percentage: {update_percentage:.2f}% (Threshold: {args.matrix_root_inv_threshold})")
+            print(f"Epoch {epoch+1}: Train Loss (Full) {full_train_loss:.4f}, Val Acc {val_acc:.2f}%, Val Loss {avg_val_loss:.4f}")
+            monitor.log_metric(epoch + 1, full_train_loss, avg_val_loss, val_acc)
             
             if writer:
                 writer.add_scalar('Loss/Train_FullBatch', full_train_loss, epoch)
-                writer.add_scalar('validation_accuracy', accuracy, epoch)
-                writer.add_scalar('validation_loss', avg_val_loss, epoch)
-                writer.add_scalar('Shampoo/Eigh_Update_Percentage', update_percentage, epoch)
-                writer.add_scalar('Shampoo/Actual_Eigh_Count', actual_eigh_calls, epoch)
-                
-                # [추가] Epoch Total Time 기록
-                writer.add_scalar('Timing/Epoch_Total', timing_tensors[0].item(), epoch)  
-                writer.add_scalar('Timing/Eigendecomposition', epoch_eigendecomp, epoch)
-                
-                # Feature 1 그래프 데이터 기록
-                if epoch in monitor.epoch_stats:
-                    s = monitor.epoch_stats[epoch]
-                    l_pct = 100.0 * s['L_updated'] / s['L_total'] if s['L_total'] > 0 else 0
-                    r_pct = 100.0 * s['R_updated'] / s['R_total'] if s['R_total'] > 0 else 0
-                    writer.add_scalar('Shampoo/Monitor_Update_Percentage_L', l_pct, epoch)
-                    writer.add_scalar('Shampoo/Monitor_Update_Percentage_R', r_pct, epoch)
-        
-        # Save checkpoint
+                writer.add_scalar('Accuracy/Val', val_acc, epoch)
+
+        # Checkpoint
         if (epoch + 1) % args.save_interval == 0:
-            print(f"Saving checkpoint...")
-            merged_optimizer_state = gather_optimizer_state_from_all_ranks(optimizer, model, global_rank, world_size)
-            
-            if global_rank==0:
-                save_path = os.path.join(args.save_dir, f"vit_checkpoint_epoch_{epoch+1}.pth")
-                print(f"Saving checkpoint to {save_path}")
+            merged_state = gather_optimizer_state_from_all_ranks(optimizer, model, global_rank, world_size)
+            if global_rank == 0:
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.module.state_dict(),
-                    'optimizer_state_dict': merged_optimizer_state,
-                    'cumulative_fallback_count': cumulative_fallback_count,
-                    'accuracy': accuracy,
-                    'val_loss': avg_val_loss,
-                    'timing_stats': {
-                        'cumulative': wall_clock_profiler.get_cumulative_summary(),
-                        'last_epoch': wall_clock_profiler.get_epoch_summary()
-                    },
-                    'total_elapsed_time': total_elapsed,
-                }, save_path)
-                print(f"Checkpoint saved!\n")
-            
+                    'optimizer_state_dict': merged_state,
+                    'accuracy': val_acc
+                }, os.path.join(args.save_dir, f"vit_epoch_{epoch+1}.pth"))
             dist.barrier()
-    
-    # Feature 3: Save plots
-    if global_rank == 0:
-        print("Saving monitoring plots...")
-        monitor.save_plots()
 
-    # Final timing report
     if global_rank == 0:
-        total_training_time = time.perf_counter() - wall_clock_profiler.training_start_time
-        cumulative_summary = wall_clock_profiler.get_cumulative_summary()
-        
-        print("\n" + "="*80)
-        print("FINAL TRAINING TIMING REPORT")
-        print("="*80)
-        print(f"Total Training Time: {total_training_time/3600:.2f} hours")
-        
-        print("="*80 + "\n")
-    
-    if writer:
-        writer.close()
+        monitor.save_plots()
+        if writer: writer.close()
     cleanup()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='ViT-Base Training with Enhanced Shampoo Timing')
-    parser.add_argument('--data-path', type=str, required=True, help='Path to cache Hugging Face datasets')
-    parser.add_argument('--log-dir', type=str, default='logs', help='Directory for TensorBoard logs')
-    parser.add_argument('--epochs', type=int, default=90, help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=256, help='Batch size per GPU')
-    parser.add_argument('--workers', type=int, default=4, help='Number of data loading workers')
-    parser.add_argument('--base-lr', type=float, default=1e-3, help='Base learning rate')
-    parser.add_argument('--warmup-steps', type=int, default=10000, help='Number of warmup steps')
-    parser.add_argument('--weight-decay', type=float, default=0.05, help='Weight decay')
-    parser.add_argument('--beta1', type=float, default=0.95, help='Adam beta1')
-    parser.add_argument('--beta2', type=float, default=0.99, help='Shampoo beta2')
-    parser.add_argument('--adam-grafting-beta2', type=float, default=0.99, help='Adam grafting beta2')
-    parser.add_argument('--grafting-epsilon', type=float, default=1e-10, help='Grafting epsilon')
-    parser.add_argument('--max-preconditioner-dim', type=int, default=1024, help='Max preconditioner dimension')
-    parser.add_argument('--precondition-frequency', type=int, default=1, help='Preconditioning frequency')
-    parser.add_argument('--start-preconditioning-step', type=int, default=1, help='Start preconditioning step')
-    parser.add_argument('--mixup', type=float, default=0.2, help='Mixup alpha')
-    parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing')
-    parser.add_argument('--log-interval', type=int, default=20, help='Logging interval')
-    parser.add_argument('--save-interval', type=int, default=10, help='Checkpoint save interval')
-    parser.add_argument('--save-dir', type=str, default='checkpoints', help='Checkpoint directory')
-    parser.add_argument('--resume', type=str, default='', help='Resume from checkpoint')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.0, help='Matrix root inverse threshold (Tau)')
-    parser.add_argument('--max-epsilon', type=float, default=1e-06, help='Maximum epsilon value for DryShampoo')
-    
-    # Epsilon configuration options
-    parser.add_argument('--epsilon-preset', type=str, default='default',
-                        choices=['default', 'asymmetric'],
-                        help='Epsilon configuration preset')
-    parser.add_argument('--epsilon', type=float, default=None, help='Custom epsilon value')
-    parser.add_argument('--epsilon-left', type=float, default=None, help='Custom left epsilon')
-    parser.add_argument('--epsilon-right', type=float, default=None, help='Custom right epsilon')
-    parser.add_argument('--use-adaptive-epsilon', action='store_true', help='Use adaptive epsilon')
+    parser = argparse.ArgumentParser(description='ViT-Base Training with DryShampoo Monitoring')
+    parser.add_argument('--data-path', type=str, required=True)
+    parser.add_argument('--log-dir', type=str, default='logs')
+    parser.add_argument('--save-dir', type=str, default='checkpoints')
+    parser.add_argument('--epochs', type=int, default=90)
+    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--base-lr', type=float, default=1e-3)
+    parser.add_argument('--warmup-steps', type=int, default=10000)
+    parser.add_argument('--weight-decay', type=float, default=0.05)
+    parser.add_argument('--beta1', type=float, default=0.95)
+    parser.add_argument('--beta2', type=float, default=0.99)
+    parser.add_argument('--adam-grafting-beta2', type=float, default=0.99)
+    parser.add_argument('--grafting-epsilon', type=float, default=1e-08)
+    parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
+    parser.add_argument('--precondition-frequency', type=int, default=1)
+    parser.add_argument('--start-preconditioning-step', type=int, default=1)
+    parser.add_argument('--mixup', type=float, default=0.2)
+    parser.add_argument('--label-smoothing', type=float, default=0.1)
+    parser.add_argument('--log-interval', type=int, default=20)
+    parser.add_argument('--save-interval', type=int, default=10)
+    parser.add_argument('--resume', type=str, default='')
+    parser.add_argument('--seed', type=int, default=42)
+
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.50)
+    parser.add_argument('--max-epsilon', type=float, default=1e-06)
+
+    parser.add_argument('--epsilon-preset', type=str, default='default', choices=['default', 'asymmetric'])
+    parser.add_argument('--epsilon', type=float, default=None)
+    parser.add_argument('--epsilon-left', type=float, default=None)
+    parser.add_argument('--epsilon-right', type=float, default=None)
+    parser.add_argument('--use-adaptive-epsilon', action='store_true')
     
     args = parser.parse_args()
-    
-    # Create necessary directories
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
-    
     train(args)

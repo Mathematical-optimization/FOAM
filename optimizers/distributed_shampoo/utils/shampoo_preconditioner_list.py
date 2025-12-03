@@ -670,13 +670,21 @@ class ShampooPreconditionerList(PreconditionerList):
                     prev_D,
                     current_epsilon
                 )
+
+                inv_root_exponent = -self._exponent_multiplier / root
+                h_eigenvalues = (prev_D + current_epsilon).pow(inv_root_exponent)
+
+                spectral_norm = h_eigenvalues.abs().max()
+                frobenius_norm = torch.norm(h_eigenvalues, p = 2)
+
+                alpha = spectral_norm / (frobenius_norm + 1e-25)
                 
                 # Line 7: Update Damping factor
                 # epsilon_t = epsilon_{t-1} * (RC / tau)
                 new_epsilon = current_epsilon * (rc_t / self._matrix_root_inv_threshold)
                 
                 # Line 8: if RC >= tau
-                if rc_t >= self._matrix_root_inv_threshold:
+                if (rc_t * alpha)>= self._matrix_root_inv_threshold:
                     # Line 9: if epsilon_t < epsilon_max
                     if new_epsilon < self._max_epsilon:
                         # Line 10: Apply updated damping to previous eigenfactors (Fast Update)
@@ -685,9 +693,8 @@ class ShampooPreconditionerList(PreconditionerList):
                         should_recompute_eigen = False
                         
                         # Construct H = Q * (D + eps*I)^(-1/p) * Q^T
-                        alpha = -self._exponent_multiplier / root
-                        eig_term = (prev_D + current_epsilon).pow(alpha)
-                        # X = Q * eig_term.unsqueeze(0) @ Q.T
+                        alpha_pow = -self._exponent_multiplier / root
+                        eig_term = (prev_D + current_epsilon).pow(alpha_pow)
                         computed_inv_factor_matrix = prev_Q * eig_term.unsqueeze(0) @ prev_Q.T
                         
                         # Update state
@@ -711,8 +718,8 @@ class ShampooPreconditionerList(PreconditionerList):
                     current_epsilon = float(new_epsilon)
                     should_recompute_eigen = False
                     
-                    alpha = -self._exponent_multiplier / root
-                    eig_term = (prev_D + current_epsilon).pow(alpha)
+                    alpha_pow = -self._exponent_multiplier / root
+                    eig_term = (prev_D + current_epsilon).pow(alpha_pow)
                     computed_inv_factor_matrix = prev_Q * eig_term.unsqueeze(0) @ prev_Q.T
                     
                     computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype=inv_factor_matrix.dtype)

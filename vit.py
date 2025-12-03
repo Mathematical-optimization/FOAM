@@ -184,21 +184,19 @@ class ShampooMonitor:
         self.save_dir = save_dir
         self.rank = rank
         
-        # 기본 학습 지표
         self.train_losses = []
         self.val_losses = []
         self.val_accuracies = []
         self.epochs = []
 
-        # DryShampoo 지표
+        # DryShampoo Stats
         self.epoch_stats = defaultdict(lambda: {'L_updated': 0, 'L_total': 0, 'R_updated': 0, 'R_total': 0})
         self.epoch_eigh_times = {}
-        
-        # RC 값 및 Epsilon 분포 (Epoch별 수집)
         self.rc_history = defaultdict(list)
         self.epsilon_history = defaultdict(list)
-        
         self.param_index_to_name = {}
+
+        self.block_history = defaultdict(lambda:defaultdict(lambda:defaultdict(lambda: {'updated' : 0 , 'total' : 0})))
 
     def register_param_names(self, model, optimizer):
         optim_params = optimizer.param_groups[0]['params']
@@ -209,21 +207,23 @@ class ShampooMonitor:
                 self.param_index_to_name[str(idx)] = name
 
     def log_metric(self, epoch, train_loss, val_loss, val_acc):
-        """기본 학습 지표 기록 (Full-batch Train Loss 사용)"""
         if self.rank != 0: return
         self.epochs.append(epoch)
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
         self.val_accuracies.append(val_acc)
 
-    def log_update(self, epoch, param_idx, dim_idx, updated, rc_value, epsilon_value):
-        """DryShampoo 상태 로깅 (RC, Epsilon 포함)"""
+    def log_update(self, epoch, block_id, param_idx, dim_idx, updated, rc_value, epsilon_value):
         if self.rank != 0: return
 
         key_prefix = 'L' if dim_idx == 0 else 'R'
         self.epoch_stats[epoch][f'{key_prefix}_total'] += 1
         if updated:
             self.epoch_stats[epoch][f'{key_prefix}_updated'] += 1
+        stats = self.block_history[block_id][dim_idx][epoch]
+        stats['total'] += 1
+        if updated:
+            stats['updated'] += 1
             
         if rc_value is not None:
             self.rc_history[epoch].append(rc_value)
@@ -233,6 +233,71 @@ class ShampooMonitor:
     def log_eigh_time(self, epoch, time_sec):
         if self.rank != 0: return
         self.epoch_eigh_times[epoch] = time_sec
+
+    def save_heatmap_plots(self):
+        if not self.block_history:
+            return
+
+        epochs = sorted(list(self.epoch_stats.keys()))
+        block_ids = sorted(self.block_history.keys(), key = lambda x:[int(k) for k in x.split('.')])
+
+        def generate_and_save(dim_idx, dim_name):
+            data = []
+            row_labels = []
+
+            for bid in block_ids:
+                param_idx = bid.split('.')[0]
+                param_name = self.param_index_to_name.get(param_idx, f"Param{param_idx}")
+                full_label = f"[{bid}] {param_name}"
+
+                row_data = []
+                has_data = False
+
+                if dim_idx not in self.block_history[bid]:
+                    continue
+
+                for e in epochs:
+                    stats = self.block_history[bid][dim_idx].get(e, {'updated': 0, 'total': 0})
+                    if stats['total'] > 0:
+                        pct = (stats['updated'] / stats['total']) * 100.0
+                        has_data = True
+                    else:
+                        pct = np.nan
+                    row_data.append(pct)
+                
+                if has_data:
+                    data.append(row_data)
+                    row_labels.append(full_label)
+
+            if not data:
+                return
+
+            df = pd.DataFrame(data, columns=epochs,index = row_labels)
+
+            chunk_size = 30
+            num_chunks = math.ceil(len(df) / chunk_size)
+
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min((i+1) * chunk_size, len(df))
+                df_subset = df.iloc[start_idx:end_idx]
+
+                if df_subset.empty:continue
+
+                plt.figure(figsize = (15, 12))
+                sns.heatmap(df_subset, annot = True, fmt='.0f', cmap='YlGnBu', vmin=0, vmax= 100,
+                            cbar_kws = {'label' : 'Update %'})
+                plt.title(f"EIGH Update Frequency ({dim_name}) - Part {i+1}/{num_chunks}")
+                plt.xlabel("Epoch")
+                plt.ylabel("Parameter Block")
+                plt.tight_layout()
+                
+                filename = f"heatmap_eigh_{dim_name}_part{i+1}.png"
+                plt.savefig(os.path.join(self.save_dir, filename))
+                plt.close()
+
+        generate_and_save(0, "L-Factor")
+        generate_and_save(1, "R-Factor")
 
     def save_plots(self):
         if self.rank != 0: return
@@ -324,13 +389,12 @@ class ShampooMonitor:
             plt.tight_layout()
             plt.savefig(os.path.join(self.save_dir, 'eigh_time_evolution.png'))
             plt.close()
+        
+        self.save_heatmap_plots()
 
     
 def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
-    """
-    ShampooPreconditionerList의 메서드를 Override하여 DryShampoo의 내부 동작을 상세히 기록합니다.
-    """
-
+    
     def patched_compute_single_root_inverse(
         self,
         factor_matrix,
@@ -357,39 +421,55 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
 
         if prev_Q is not None and prev_D is not None and self._matrix_root_inv_threshold > 0.0:
             try:
+                # 1. Calculate RC
                 rc_t = self._compute_relative_condition_number(
                     bias_corrected_factor_matrix, prev_Q, prev_D, current_epsilon
                 )
                 rc_val_to_log = rc_t.item()
 
+                # 2. Calculate Alpha
+                inv_root_exponent = -self._exponent_multiplier / root
+                h_eigenvalues = (prev_D + current_epsilon).pow(inv_root_exponent)
+                
+                spectral_norm = h_eigenvalues.abs().max()
+                frobenius_norm = torch.norm(h_eigenvalues, p=2)
+                alpha = spectral_norm / (frobenius_norm + 1e-25)
+
+                # 3. Propose New Epsilon
                 new_epsilon = current_epsilon * (rc_t / self._matrix_root_inv_threshold)
                 
-                if rc_t >= self._matrix_root_inv_threshold:
+                # 4. Check Condition (RC * alpha >= tau)
+                if (rc_t * alpha) >= self._matrix_root_inv_threshold:
+                    # Unstable
                     if new_epsilon < self._max_epsilon:
+                        # Fast Update
                         current_epsilon = float(new_epsilon)
                         should_recompute_eigen = False
                         
-                        alpha = -self._exponent_multiplier / root
-                        eig_term = (prev_D + current_epsilon).pow(alpha)
+                        alpha_pow = -self._exponent_multiplier / root
+                        eig_term = (prev_D + current_epsilon).pow(alpha_pow)
                         computed_inv_factor_matrix = prev_Q * eig_term.unsqueeze(0) @ prev_Q.T
                         
                         computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype=inv_factor_matrix.dtype)
                         inv_factor_matrix.copy_(computed_inv_factor_matrix)
                         kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon
                     else:
+                        # Slow Update (Reset)
                         current_epsilon = epsilon_value
                         should_recompute_eigen = True 
                 else:
+                    # Stable -> Fast Update (Reduce Epsilon)
                     current_epsilon = float(new_epsilon)
                     should_recompute_eigen = False
                     
-                    alpha = -self._exponent_multiplier / root
-                    eig_term = (prev_D + current_epsilon).pow(alpha)
+                    alpha_pow = -self._exponent_multiplier / root
+                    eig_term = (prev_D + current_epsilon).pow(alpha_pow)
                     computed_inv_factor_matrix = prev_Q * eig_term.unsqueeze(0) @ prev_Q.T
                     
                     computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype=inv_factor_matrix.dtype)
                     inv_factor_matrix.copy_(computed_inv_factor_matrix)
-                    kronecker_factors.adaptive_eps_epsilons[factor_idx] = current_epsilon
+                    # [CORRECTED] Fixed variable name typo here
+                    kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon 
                     
             except Exception:
                 should_recompute_eigen = True
@@ -421,18 +501,22 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
             except Exception:
                 pass
 
+        # 모니터링 데이터 수집
         end_eigh_count = eigh_monitor.total_count
         performed_eigh = (end_eigh_count > start_eigh_count)
         
         try:
             parts = factor_matrix_index.split('.')
-            p_idx = parts[0]
+            block_id = f"{parts[0]}.{parts[1]}"
             d_idx = int(parts[-1])
             epoch = current_epoch_fn()
-            monitor.log_update(epoch, p_idx, d_idx, performed_eigh, rc_val_to_log, current_epsilon)
+            # Note: param_idx in log_update arguments was redundant/confusing, removed in ShampooMonitor.log_update signature above
+            # but called here. Adjusted ShampooMonitor.log_update to match.
+            monitor.log_update(epoch, block_id, None, d_idx, performed_eigh, rc_val_to_log, current_epsilon)
         except Exception:
             pass
 
+    from optimizers.distributed_shampoo.utils.shampoo_preconditioner_list import ShampooPreconditionerList
     ShampooPreconditionerList._compute_single_root_inverse = patched_compute_single_root_inverse
 
 def validate_on_trainset(model, train_loader, criterion, device, rank, world_size):
@@ -865,6 +949,11 @@ def train(args: argparse.Namespace):
         if global_rank == 0:
             monitor.log_eigh_time(epoch, avg_eigh_time)
 
+        # -----------------------------------------------------------
+        # [NEW] Epoch Wall-clock Time Calculation (excluding validation)
+        # -----------------------------------------------------------
+        epoch_duration = time.perf_counter() - epoch_start_time
+
         # Feature 3: Full-batch Training Loss Calculation
         if global_rank == 0:
             print(f"Calculating Full-batch Training Loss for Epoch {epoch+1}...")
@@ -893,15 +982,32 @@ def train(args: argparse.Namespace):
         val_acc = 100 * correct_t.item() / total_t.item() if total_t.item() > 0 else 0.0
         avg_val_loss = val_loss_t.item() / world_size / len(val_loader)
 
+        # -----------------------------------------------------------
+        # [NEW] Eigh Update Percentage Calculation
+        # -----------------------------------------------------------
+        l_update_pct = 0.0
+        r_update_pct = 0.0
+        if epoch + 1 in monitor.epoch_stats:
+            stats = monitor.epoch_stats[epoch + 1]
+            if stats['L_total'] > 0:
+                l_update_pct = (stats['L_updated'] / stats['L_total']) * 100
+            if stats['R_total'] > 0:
+                r_update_pct = (stats['R_updated'] / stats['R_total']) * 100
+
         if global_rank == 0:
             print(f"Epoch {epoch+1}: Train Loss (Full) {full_train_loss:.4f}, Val Acc {val_acc:.2f}%, Val Loss {avg_val_loss:.4f}")
             monitor.log_metric(epoch + 1, full_train_loss, avg_val_loss, val_acc)
             
+            # [UPDATED] WandB Logging
             wandb.log({
                 'train_loss': full_train_loss,
                 'val_acc': val_acc,
+                'val_loss': avg_val_loss,
                 'epoch': epoch,
-                'shampoo/avg_eigh_time': avg_eigh_time
+                'shampoo/avg_eigh_time': avg_eigh_time,
+                'shampoo/epoch_time': epoch_duration,
+                'shampoo/L_update_pct': l_update_pct,
+                'shampoo/R_update_pct': r_update_pct
             })
 
             if writer:
@@ -953,7 +1059,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.5)
     parser.add_argument('--max-epsilon', type=float, default=5e-07)
-    parser.add_argument('--project', type=str, default='ViT-Training')
+    parser.add_argument('--project', type=str, default='DryShampoo_Experiment_ViT')
     parser.add_argument('--entity', type=str, default = 'Kyunghun')
 
     parser.add_argument('--epsilon-preset', type=str, default='default', choices=['default', 'asymmetric'])

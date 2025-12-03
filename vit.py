@@ -18,7 +18,7 @@ import functools
 import time
 from dataclasses import dataclass, field
 from collections import defaultdict
-
+import wandb
 # 시각화를 위한 라이브러리 추가
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -635,16 +635,16 @@ def apply_transforms(examples: Dict[str, List[Image.Image]], transform) -> Dict[
 def get_epsilon_config(args):
     presets = {
         'default': {
-            'epsilon': 1e-08,
+            'epsilon': 1e-09,
             'epsilon_left': None,
             'epsilon_right': None,
             'use_adaptive_epsilon': False,
             'condition_thresholds': None
         },
         'asymmetric': {
-            'epsilon': 1e-10,
+            'epsilon': 1e-09,
             'epsilon_left': 1e-08,
-            'epsilon_right': 1e-05,
+            'epsilon_right': 1e-08,
             'use_adaptive_epsilon': False,
             'condition_thresholds': None
         },
@@ -693,6 +693,12 @@ def train(args: argparse.Namespace):
     
     if global_rank == 0:
         print(f"Running DDP training. Global Rank: {global_rank}, Local Rank: {local_rank}, World Size: {world_size}")
+        wandb.init(
+            project = args.project,
+            entity = args.entity,
+            config = vars(args),
+            dir=args.log_dir    
+        )
 
     writer = SummaryWriter(log_dir=args.log_dir) if global_rank == 0 else None
     wall_clock_profiler.training_start_time = time.perf_counter()
@@ -844,6 +850,13 @@ def train(args: argparse.Namespace):
             if global_rank == 0 and (i + 1) % args.log_interval == 0:
                 print(f"Epoch [{epoch+1}/{args.epochs}] Step [{i+1}/{len(train_loader)}] Loss: {loss.item():.4f}")
 
+                wandb.log({
+                    'train_loss': loss.item(),
+                    'learning_rate': new_lr,
+                    'epoch': epoch,
+                    'step': current_step
+                })
+
         # Feature 4: Eigh Time Logging
         epoch_eigendecomp_time = wall_clock_profiler.get_stats("eigendecomposition").epoch_time
         dist_eigh_time = torch.tensor(epoch_eigendecomp_time).to(local_rank)
@@ -884,6 +897,13 @@ def train(args: argparse.Namespace):
             print(f"Epoch {epoch+1}: Train Loss (Full) {full_train_loss:.4f}, Val Acc {val_acc:.2f}%, Val Loss {avg_val_loss:.4f}")
             monitor.log_metric(epoch + 1, full_train_loss, avg_val_loss, val_acc)
             
+            wandb.log({
+                'train_loss': full_train_loss,
+                'val_acc': val_acc,
+                'epoch': epoch,
+                'shampoo/avg_eigh_time': avg_eigh_time
+            })
+
             if writer:
                 writer.add_scalar('Loss/Train_FullBatch', full_train_loss, epoch)
                 writer.add_scalar('Accuracy/Val', val_acc, epoch)
@@ -902,6 +922,7 @@ def train(args: argparse.Namespace):
 
     if global_rank == 0:
         monitor.save_plots()
+        wandb.finish()
         if writer: writer.close()
     cleanup()
 
@@ -917,9 +938,9 @@ if __name__ == '__main__':
     parser.add_argument('--warmup-steps', type=int, default=10000)
     parser.add_argument('--weight-decay', type=float, default=0.05)
     parser.add_argument('--beta1', type=float, default=0.95)
-    parser.add_argument('--beta2', type=float, default=0.99)
-    parser.add_argument('--adam-grafting-beta2', type=float, default=0.99)
-    parser.add_argument('--grafting-epsilon', type=float, default=1e-08)
+    parser.add_argument('--beta2', type=float, default=0.995)
+    parser.add_argument('--adam-grafting-beta2', type=float, default=0.995)
+    parser.add_argument('--grafting-epsilon', type=float, default=1e-09)
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
     parser.add_argument('--precondition-frequency', type=int, default=1)
     parser.add_argument('--start-preconditioning-step', type=int, default=1)
@@ -930,8 +951,10 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=str, default='')
     parser.add_argument('--seed', type=int, default=42)
 
-    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.75)
-    parser.add_argument('--max-epsilon', type=float, default=1e-06)
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.5)
+    parser.add_argument('--max-epsilon', type=float, default=5e-07)
+    parser.add_argument('--project', type=str, default='ViT-Training')
+    parser.add_argument('--entity', type=str, default = 'Kyunghun')
 
     parser.add_argument('--epsilon-preset', type=str, default='default', choices=['default', 'asymmetric'])
     parser.add_argument('--epsilon', type=float, default=None)

@@ -436,13 +436,14 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                 alpha = spectral_norm / (frobenius_norm + 1e-25)
 
                 # 3. Propose New Epsilon
-                new_epsilon = current_epsilon * (rc_t / self._matrix_root_inv_threshold)
+                # Formula: epsilon_t = epsilon_{t-1} * (RC * alpha) / tau
+                new_epsilon = current_epsilon * ((rc_t * alpha) / self._matrix_root_inv_threshold)
                 
                 # 4. Check Condition (RC * alpha >= tau)
                 if (rc_t * alpha) >= self._matrix_root_inv_threshold:
                     # Unstable
                     if new_epsilon < self._max_epsilon:
-                        # Fast Update
+                        # Fast Update (Dry update)
                         current_epsilon = float(new_epsilon)
                         should_recompute_eigen = False
                         
@@ -454,7 +455,7 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                         inv_factor_matrix.copy_(computed_inv_factor_matrix)
                         kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon
                     else:
-                        # Slow Update (Reset)
+                        # Slow Update (Reset) - Fresh update
                         current_epsilon = epsilon_value
                         should_recompute_eigen = True 
                 else:
@@ -468,7 +469,6 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                     
                     computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype=inv_factor_matrix.dtype)
                     inv_factor_matrix.copy_(computed_inv_factor_matrix)
-                    # [CORRECTED] Fixed variable name typo here
                     kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon 
                     
             except Exception:
@@ -934,12 +934,8 @@ def train(args: argparse.Namespace):
             if global_rank == 0 and (i + 1) % args.log_interval == 0:
                 print(f"Epoch [{epoch+1}/{args.epochs}] Step [{i+1}/{len(train_loader)}] Loss: {loss.item():.4f}")
 
-                wandb.log({
-                    'train_loss': loss.item(),
-                    'learning_rate': new_lr,
-                    'epoch': epoch,
-                    'step': current_step
-                })
+                # Iteration-level logging removed per request
+                # wandb.log(...)
 
         # Feature 4: Eigh Time Logging
         epoch_eigendecomp_time = wall_clock_profiler.get_stats("eigendecomposition").epoch_time
@@ -998,12 +994,13 @@ def train(args: argparse.Namespace):
             print(f"Epoch {epoch+1}: Train Loss (Full) {full_train_loss:.4f}, Val Acc {val_acc:.2f}%, Val Loss {avg_val_loss:.4f}")
             monitor.log_metric(epoch + 1, full_train_loss, avg_val_loss, val_acc)
             
-            # [UPDATED] WandB Logging
+            # [UPDATED] WandB Logging (Epoch-level)
             wandb.log({
                 'train_loss': full_train_loss,
                 'val_acc': val_acc,
                 'val_loss': avg_val_loss,
                 'epoch': epoch,
+                'learning_rate': new_lr, # Log learning rate at epoch end
                 'shampoo/avg_eigh_time': avg_eigh_time,
                 'shampoo/epoch_time': epoch_duration,
                 'shampoo/L_update_pct': l_update_pct,

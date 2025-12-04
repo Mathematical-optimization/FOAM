@@ -421,7 +421,6 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
 
         if prev_Q is not None and prev_D is not None and self._matrix_root_inv_threshold > 0.0:
             try:
-                # 1. Calculate RC
                 rc_t = self._compute_relative_condition_number(
                     bias_corrected_factor_matrix, prev_Q, prev_D, current_epsilon
                 )
@@ -436,18 +435,18 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                 alpha = spectral_norm / (frobenius_norm + 1e-25)
 
                 # 3. Propose New Epsilon
-                # Formula: epsilon_t = epsilon_{t-1} * (RC * alpha) / tau
                 new_epsilon = current_epsilon * ((rc_t * alpha) / self._matrix_root_inv_threshold)
                 
-                # 4. Check Condition (RC * alpha >= tau)
+                # 4. Check Condition
                 if (rc_t * alpha) >= self._matrix_root_inv_threshold:
                     # Unstable
                     if new_epsilon < self._max_epsilon:
-                        # Fast Update (Dry update)
+                        
                         current_epsilon = float(new_epsilon)
                         should_recompute_eigen = False
                         
                         alpha_pow = -self._exponent_multiplier / root
+                        
                         eig_term = (prev_D + current_epsilon).pow(alpha_pow)
                         computed_inv_factor_matrix = prev_Q * eig_term.unsqueeze(0) @ prev_Q.T
                         
@@ -455,11 +454,11 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                         inv_factor_matrix.copy_(computed_inv_factor_matrix)
                         kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon
                     else:
-                        # Slow Update (Reset) - Fresh update
+                        # Slow Update (Reset)
                         current_epsilon = epsilon_value
                         should_recompute_eigen = True 
                 else:
-                    # Stable -> Fast Update (Reduce Epsilon)
+                    # Stable -> Fast Update
                     current_epsilon = float(new_epsilon)
                     should_recompute_eigen = False
                     
@@ -488,10 +487,11 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                     retry_double_precision=self._use_protected_eigh,
                 )
                 
-                computed_inv_factor_matrix, _, L, Q = result
+                computed_inv_factor_matrix, used_epsilon, L, Q = result
                 
                 if L is not None and Q is not None:
-                    kronecker_factors.eigenvalues[factor_idx] = L.to(dtype=factor_matrix.dtype)
+                    raw_eigenvalues = L - used_epsilon
+                    kronecker_factors.eigenvalues[factor_idx] = raw_eigenvalues.to(dtype=factor_matrix.dtype)
                     kronecker_factors.eigenvectors[factor_idx] = Q.to(dtype=factor_matrix.dtype)
                     kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon
                 
@@ -501,17 +501,21 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
             except Exception:
                 pass
 
-        # 모니터링 데이터 수집
+        
         end_eigh_count = eigh_monitor.total_count
         performed_eigh = (end_eigh_count > start_eigh_count)
         
         try:
             parts = factor_matrix_index.split('.')
-            block_id = f"{parts[0]}.{parts[1]}"
+            
+            if len(parts) >= 2:
+                block_id = f"{parts[0]}.{parts[1]}"
+            else:
+                block_id = parts[0]
+                
             d_idx = int(parts[-1])
             epoch = current_epoch_fn()
-            # Note: param_idx in log_update arguments was redundant/confusing, removed in ShampooMonitor.log_update signature above
-            # but called here. Adjusted ShampooMonitor.log_update to match.
+            
             monitor.log_update(epoch, block_id, None, d_idx, performed_eigh, rc_val_to_log, current_epsilon)
         except Exception:
             pass
@@ -1055,7 +1059,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=42)
 
     parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.5)
-    parser.add_argument('--max-epsilon', type=float, default=5e-07)
+    parser.add_argument('--max-epsilon', type=float, default=1e-07)
     parser.add_argument('--project', type=str, default='DryShampoo_Experiment_ViT')
     parser.add_argument('--entity', type=str, default = 'Kyunghun')
 

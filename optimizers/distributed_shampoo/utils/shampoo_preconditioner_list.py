@@ -680,11 +680,12 @@ class ShampooPreconditionerList(PreconditionerList):
                 alpha = spectral_norm / (frobenius_norm + 1e-25)
                 
                 # Line 7: Update Damping factor
-                # epsilon_t = epsilon_{t-1} * (RC / tau)
-                new_epsilon = current_epsilon * (rc_t / self._matrix_root_inv_threshold)
+                # epsilon_t = epsilon_{t-1} * (RC / tau) * alpha
+                # [FIX] vit.py와 동일하게 alpha를 포함하여 계산
+                new_epsilon = current_epsilon * ((rc_t * alpha) / self._matrix_root_inv_threshold)
                 
-                # Line 8: if RC >= tau
-                if (rc_t * alpha)>= self._matrix_root_inv_threshold:
+                # Line 8: if RC * alpha >= tau
+                if (rc_t * alpha) >= self._matrix_root_inv_threshold:
                     # Line 9: if epsilon_t < epsilon_max
                     if new_epsilon < self._max_epsilon:
                         # Line 10: Apply updated damping to previous eigenfactors (Fast Update)
@@ -694,6 +695,7 @@ class ShampooPreconditionerList(PreconditionerList):
                         
                         # Construct H = Q * (D + eps*I)^(-1/p) * Q^T
                         alpha_pow = -self._exponent_multiplier / root
+                        # prev_D는 이제 Raw Eigenvalues이므로 epsilon을 여기서 더해줍니다.
                         eig_term = (prev_D + current_epsilon).pow(alpha_pow)
                         computed_inv_factor_matrix = prev_Q * eig_term.unsqueeze(0) @ prev_Q.T
                         
@@ -719,6 +721,7 @@ class ShampooPreconditionerList(PreconditionerList):
                     should_recompute_eigen = False
                     
                     alpha_pow = -self._exponent_multiplier / root
+                    # prev_D는 Raw Eigenvalues이므로 epsilon을 여기서 더해줍니다.
                     eig_term = (prev_D + current_epsilon).pow(alpha_pow)
                     computed_inv_factor_matrix = prev_Q * eig_term.unsqueeze(0) @ prev_Q.T
                     
@@ -737,6 +740,7 @@ class ShampooPreconditionerList(PreconditionerList):
 
             try:
                 # Use matrix_inverse_root from matrix_functions
+                # [FIX] used_epsilon을 반환받습니다.
                 result = matrix_inverse_root(
                     A=bias_corrected_factor_matrix,
                     root=root,
@@ -746,10 +750,13 @@ class ShampooPreconditionerList(PreconditionerList):
                     retry_double_precision=self._use_protected_eigh,
                 )
                 
-                computed_inv_factor_matrix, _, L, Q = result
+                computed_inv_factor_matrix, used_epsilon, L, Q = result
                 
                 if L is not None and Q is not None:
-                    kronecker_factors.eigenvalues[factor_idx] = L.to(dtype=factor_matrix.dtype)
+                    # [FIX] L은 epsilon이 더해진 상태이므로, 저장할 때는 epsilon을 뺍니다.
+                    # 이를 통해 다음 step에서 (prev_D + current_epsilon) 계산 시 중복 더해짐을 방지합니다.
+                    raw_eigenvalues = L - used_epsilon
+                    kronecker_factors.eigenvalues[factor_idx] = raw_eigenvalues.to(dtype=factor_matrix.dtype)
                     kronecker_factors.eigenvectors[factor_idx] = Q.to(dtype=factor_matrix.dtype)
                     # Store the epsilon used for this decomposition
                     kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon

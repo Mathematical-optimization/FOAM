@@ -183,6 +183,12 @@ class DistributedShampoo(torch.optim.Optimizer):
                 raise ValueError(
                     f"Invalid exponent override: {inv_root_override}. Must be >= 0."
                 )
+        if not 0.0 <= matrix_root_inv_threshold < 1.0:
+            raise ValueError(
+                f"Invalid matrix_root_inv_threshold : {matrix_root_inv_threshold}."
+                "Must be in [0.0, 1.0)."
+            )
+        
         if track_root_inv_residuals:
             logger.setLevel(logging.DEBUG)
 

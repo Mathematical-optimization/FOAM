@@ -239,7 +239,35 @@ class ShampooMonitor:
             return
 
         epochs = sorted(list(self.epoch_stats.keys()))
-        block_ids = sorted(self.block_history.keys(), key = lambda x:[int(k) for k in x.split('.')])
+        
+        # [FIX] 'block_0'과 같은 문자열을 처리하기 위한 정렬 키 함수
+        def sort_key_wrapper(x):
+            parts = x.split('.')
+            # 첫 번째 부분(파라미터 인덱스)은 정수로 변환
+            try:
+                param_idx = int(parts[0])
+            except ValueError:
+                param_idx = parts[0]
+            
+            # 두 번째 부분(블록 이름)은 문자열 그대로 사용하되, 
+            # 가능한 경우 뒤쪽 숫자를 추출하여 정렬 (예: block_2 vs block_10 정렬 보정)
+            block_name = parts[1] if len(parts) > 1 else ""
+            block_num = -1
+            # 문자열 끝에서 숫자 추출 시도
+            if block_name and block_name[-1].isdigit():
+                num_str = ''
+                for char in reversed(block_name):
+                    if char.isdigit():
+                        num_str = char + num_str
+                    else:
+                        break
+                if num_str:
+                    block_num = int(num_str)
+            
+            return (param_idx, block_name, block_num)
+
+        # 수정된 정렬 키 사용
+        block_ids = sorted(self.block_history.keys(), key=sort_key_wrapper)
 
         def generate_and_save(dim_idx, dim_name):
             data = []
@@ -938,9 +966,6 @@ def train(args: argparse.Namespace):
             if global_rank == 0 and (i + 1) % args.log_interval == 0:
                 print(f"Epoch [{epoch+1}/{args.epochs}] Step [{i+1}/{len(train_loader)}] Loss: {loss.item():.4f}")
 
-                # Iteration-level logging removed per request
-                # wandb.log(...)
-
         # Feature 4: Eigh Time Logging
         epoch_eigendecomp_time = wall_clock_profiler.get_stats("eigendecomposition").epoch_time
         dist_eigh_time = torch.tensor(epoch_eigendecomp_time).to(local_rank)
@@ -987,8 +1012,8 @@ def train(args: argparse.Namespace):
         # -----------------------------------------------------------
         l_update_pct = 0.0
         r_update_pct = 0.0
-        if epoch + 1 in monitor.epoch_stats:
-            stats = monitor.epoch_stats[epoch + 1]
+        if epoch in monitor.epoch_stats:
+            stats = monitor.epoch_stats[epoch]
             if stats['L_total'] > 0:
                 l_update_pct = (stats['L_updated'] / stats['L_total']) * 100
             if stats['R_total'] > 0:
@@ -1058,7 +1083,7 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=str, default='')
     parser.add_argument('--seed', type=int, default=42)
 
-    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.5)
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.25)
     parser.add_argument('--max-epsilon', type=float, default=1e-07)
     parser.add_argument('--project', type=str, default='DryShampoo_Experiment_ViT')
     parser.add_argument('--entity', type=str, default = 'Kyunghun')

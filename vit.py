@@ -979,56 +979,56 @@ def train(args: argparse.Namespace):
         avg_val_loss = val_loss_t.item() / world_size / len(val_loader)
 
         # -----------------------------------------------------------
-        # [NEW] Eigh Update Percentage Calculation
+        # [MODIFIED] Aggregate Eigh Counts & Epsilon & Rates across ALL ranks
         # -----------------------------------------------------------
-        l_update_pct = 0.0
-        r_update_pct = 0.0
-        if epoch in monitor.epoch_stats:
-            stats = monitor.epoch_stats[epoch]
-            if stats['L_total'] > 0:
-                l_update_pct = (stats['L_updated'] / stats['L_total']) * 100
-            if stats['R_total'] > 0:
-                r_update_pct = (stats['R_updated'] / stats['R_total']) * 100
-
-        # [NEW] Aggregate Eigh Counts & Epsilon across all ranks
+        
+        # [L_updated, R_updated, Sum_Eps_L, Count_Eps_L, Sum_Eps_R, Count_Eps_R]
         local_stats = monitor.get_local_epoch_data(epoch)
         local_stats = local_stats.to(local_rank)
+        
+        # 2. All-Reduce SUM
         dist.all_reduce(local_stats, op=dist.ReduceOp.SUM)
         
-        global_l_up = int(local_stats[0].item())
-        global_r_up = int(local_stats[1].item())
         
-        # Avoid division by zero
-        avg_eps_l = local_stats[2].item() / max(1, local_stats[3].item())
-        avg_eps_r = local_stats[4].item() / max(1, local_stats[5].item())
+        global_l_up = int(local_stats[0].item())      
+        global_r_up = int(local_stats[1].item())      
+        
+        global_l_total = int(local_stats[3].item())   
+        global_r_total = int(local_stats[5].item())   
+        
+        # 4.Global Update Percentage
+        l_update_pct = (global_l_up / global_l_total * 100) if global_l_total > 0 else 0.0
+        r_update_pct = (global_r_up / global_r_total * 100) if global_r_total > 0 else 0.0
+        
+        # 5. Epsilon
+        avg_eps_l = local_stats[2].item() / max(1, global_l_total)
+        avg_eps_r = local_stats[4].item() / max(1, global_r_total)
 
         if global_rank == 0:
             print(f"Epoch {epoch+1}: Train Loss (Full) {full_train_loss:.4f}, Val Acc {val_acc:.2f}%, Val Loss {avg_val_loss:.4f}, Time {epoch_duration:.2f}s")
             print(f"  Total L/R Eigh Counts: {global_l_up} / {global_r_up}")
+            print(f"  Total L/R Blocks: {global_l_total} / {global_r_total}")  
+            print(f"  Global Update % (L/R): {l_update_pct:.2f}% / {r_update_pct:.2f}%") 
             print(f"  Avg Epsilon L/R: {avg_eps_l:.2e} / {avg_eps_r:.2e}")
             
             monitor.log_metric(epoch + 1, full_train_loss, avg_val_loss, val_acc, epoch_duration)
             
-            # [UPDATED] WandB Logging (Epoch-level)
+            # WandB Logging
             wandb.log({
                 'train_loss': full_train_loss,
                 'val_acc': val_acc,
                 'val_loss': avg_val_loss,
                 'epoch': epoch,
-                'learning_rate': new_lr, # Log learning rate at epoch end
+                'learning_rate': new_lr,
                 'shampoo/avg_eigh_time': avg_eigh_time,
                 'shampoo/epoch_time': epoch_duration,
-                'shampoo/L_update_pct': l_update_pct,
-                'shampoo/R_update_pct': r_update_pct,
+                'shampoo/L_update_pct': l_update_pct,       # Global %
+                'shampoo/R_update_pct': r_update_pct,       # Global %
                 'shampoo/total_L_eigh_count': global_l_up,
                 'shampoo/total_R_eigh_count': global_r_up,
                 'shampoo/avg_epsilon_L': avg_eps_l,
                 'shampoo/avg_epsilon_R': avg_eps_r
             })
-
-            if writer:
-                writer.add_scalar('Loss/Train_FullBatch', full_train_loss, epoch)
-                writer.add_scalar('Accuracy/Val', val_acc, epoch)
 
         # Checkpoint
         if (epoch + 1) % args.save_interval == 0:
@@ -1070,8 +1070,8 @@ if __name__ == '__main__':
     parser.add_argument('--adam-grafting-beta2', type=float, default=0.995)
     parser.add_argument('--grafting-epsilon', type=float, default=1e-09)
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
-    parser.add_argument('--precondition-frequency', type=int, default=25)
-    parser.add_argument('--start-preconditioning-step', type=int, default=25)
+    parser.add_argument('--precondition-frequency', type=int, default=1)
+    parser.add_argument('--start-preconditioning-step', type=int, default=1)
     parser.add_argument('--mixup', type=float, default=0.2)
     parser.add_argument('--label-smoothing', type=float, default=0.1)
     parser.add_argument('--log-interval', type=int, default=20)
@@ -1079,7 +1079,7 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=str, default='')
     parser.add_argument('--seed', type=int, default=42)
 
-    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.0)
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.5)
     parser.add_argument('--max-epsilon', type=float, default=1e-07)
     parser.add_argument('--project', type=str, default='DryShampoo_Experiment_ViT')
     parser.add_argument('--entity', type=str, default = 'Kyunghun')

@@ -180,20 +180,24 @@ def count_total_shampoo_factors(optimizer):
 
 class ShampooMonitor:
     """Shampoo 업데이트 통계 및 DryShampoo 핵심 지표 시각화 클래스"""
-    def __init__(self, save_dir, rank):
+    def __init__(self, save_dir, rank, world_size):
         self.save_dir = save_dir
         self.rank = rank
+        self.world_size = world_size
         
         self.train_losses = []
         self.val_losses = []
         self.val_accuracies = []
         self.epochs = []
+        # [Added] 에폭별 소요 시간 저장
+        self.epoch_times = []
 
         # DryShampoo Stats
         self.epoch_stats = defaultdict(lambda: {'L_updated': 0, 'L_total': 0, 'R_updated': 0, 'R_total': 0})
         self.epoch_eigh_times = {}
         self.rc_history = defaultdict(list)
-        self.epsilon_history = defaultdict(list)
+        # Epsilon을 L/R로 구분하여 저장
+        self.epsilon_history = defaultdict(lambda: {'L': [], 'R': []})
         self.param_index_to_name = {}
 
         self.block_history = defaultdict(lambda:defaultdict(lambda:defaultdict(lambda: {'updated' : 0 , 'total' : 0})))
@@ -206,20 +210,23 @@ class ShampooMonitor:
                 idx = param_id_to_index[id(param)]
                 self.param_index_to_name[str(idx)] = name
 
-    def log_metric(self, epoch, train_loss, val_loss, val_acc):
+    # [Modified] epoch_time 인자 추가
+    def log_metric(self, epoch, train_loss, val_loss, val_acc, epoch_time):
         if self.rank != 0: return
         self.epochs.append(epoch)
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
         self.val_accuracies.append(val_acc)
+        self.epoch_times.append(epoch_time)
 
     def log_update(self, epoch, block_id, param_idx, dim_idx, updated, rc_value, epsilon_value):
-        if self.rank != 0: return
-
+        # 모든 Rank가 자신의 통계를 기록
         key_prefix = 'L' if dim_idx == 0 else 'R'
+        
         self.epoch_stats[epoch][f'{key_prefix}_total'] += 1
         if updated:
             self.epoch_stats[epoch][f'{key_prefix}_updated'] += 1
+        
         stats = self.block_history[block_id][dim_idx][epoch]
         stats['total'] += 1
         if updated:
@@ -227,33 +234,87 @@ class ShampooMonitor:
             
         if rc_value is not None:
             self.rc_history[epoch].append(rc_value)
+        
         if epsilon_value is not None:
-            self.epsilon_history[epoch].append(epsilon_value)
+            self.epsilon_history[epoch][key_prefix].append(epsilon_value)
 
     def log_eigh_time(self, epoch, time_sec):
         if self.rank != 0: return
         self.epoch_eigh_times[epoch] = time_sec
 
+    def gather_stats(self):
+        """Gather stats from all ranks to rank 0"""
+        if self.world_size <= 1:
+            return
+
+        # 1. Epoch Stats
+        local_epoch_stats = dict(self.epoch_stats)
+        gathered_epoch_stats = [None for _ in range(self.world_size)]
+        dist.all_gather_object(gathered_epoch_stats, local_epoch_stats)
+
+        # 2. Block History
+        local_block_history = dict(self.block_history)
+        gathered_block_history = [None for _ in range(self.world_size)]
+        dist.all_gather_object(gathered_block_history, local_block_history)
+
+        # 3. RC History
+        local_rc = dict(self.rc_history)
+        gathered_rc = [None for _ in range(self.world_size)]
+        dist.all_gather_object(gathered_rc, local_rc)
+
+        # 4. Epsilon History
+        local_eps = dict(self.epsilon_history)
+        gathered_eps = [None for _ in range(self.world_size)]
+        dist.all_gather_object(gathered_eps, local_eps)
+
+        if self.rank == 0:
+            # Merge Epoch Stats (Sum)
+            merged_epoch_stats = defaultdict(lambda: {'L_updated': 0, 'L_total': 0, 'R_updated': 0, 'R_total': 0})
+            for stats in gathered_epoch_stats:
+                for epoch, counts in stats.items():
+                    for k in counts:
+                        merged_epoch_stats[epoch][k] += counts[k]
+            self.epoch_stats = merged_epoch_stats
+
+            # Merge Block History (Update)
+            merged_block_history = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {'updated': 0, 'total': 0})))
+            for history in gathered_block_history:
+                for block_id, dim_dict in history.items():
+                    for dim_idx, epoch_dict in dim_dict.items():
+                        merged_block_history[block_id][dim_idx].update(epoch_dict)
+            self.block_history = merged_block_history
+
+            # Merge RC (Extend lists)
+            merged_rc = defaultdict(list)
+            for rc_data in gathered_rc:
+                for epoch, values in rc_data.items():
+                    merged_rc[epoch].extend(values)
+            self.rc_history = merged_rc
+
+            # Merge Epsilon (L/R 각각 Extend)
+            merged_eps = defaultdict(lambda: {'L': [], 'R': []})
+            for eps_data in gathered_eps:
+                for epoch, values_dict in eps_data.items():
+                    merged_eps[epoch]['L'].extend(values_dict.get('L', []))
+                    merged_eps[epoch]['R'].extend(values_dict.get('R', []))
+            self.epsilon_history = merged_eps
+
     def save_heatmap_plots(self):
+        if self.rank != 0: return
         if not self.block_history:
             return
 
         epochs = sorted(list(self.epoch_stats.keys()))
         
-        # [FIX] 'block_0'과 같은 문자열을 처리하기 위한 정렬 키 함수
         def sort_key_wrapper(x):
             parts = x.split('.')
-            # 첫 번째 부분(파라미터 인덱스)은 정수로 변환
             try:
                 param_idx = int(parts[0])
             except ValueError:
                 param_idx = parts[0]
             
-            # 두 번째 부분(블록 이름)은 문자열 그대로 사용하되, 
-            # 가능한 경우 뒤쪽 숫자를 추출하여 정렬 (예: block_2 vs block_10 정렬 보정)
             block_name = parts[1] if len(parts) > 1 else ""
             block_num = -1
-            # 문자열 끝에서 숫자 추출 시도
             if block_name and block_name[-1].isdigit():
                 num_str = ''
                 for char in reversed(block_name):
@@ -266,7 +327,6 @@ class ShampooMonitor:
             
             return (param_idx, block_name, block_num)
 
-        # 수정된 정렬 키 사용
         block_ids = sorted(self.block_history.keys(), key=sort_key_wrapper)
 
         def generate_and_save(dim_idx, dim_name):
@@ -388,20 +448,37 @@ class ShampooMonitor:
                 plt.savefig(os.path.join(self.save_dir, 'rc_distribution.png'))
             plt.close()
 
-        # 4. Epsilon Evolution
+        # 4. Epsilon Evolution (L/R 분리)
         if self.epsilon_history:
-            avg_eps = [sum(self.epsilon_history[e])/len(self.epsilon_history[e]) for e in epochs if e in self.epsilon_history]
-            valid_epochs = [e for e in epochs if e in self.epsilon_history]
+            epochs = sorted(self.epsilon_history.keys())
+            avg_eps_l = []
+            avg_eps_r = []
+            valid_epochs = []
+
+            for e in epochs:
+                eps_dict = self.epsilon_history[e]
+                l_vals = eps_dict.get('L', [])
+                r_vals = eps_dict.get('R', [])
+                
+                if l_vals or r_vals:
+                    valid_epochs.append(e)
+                    avg_l = sum(l_vals)/len(l_vals) if l_vals else 0.0
+                    avg_r = sum(r_vals)/len(r_vals) if r_vals else 0.0
+                    avg_eps_l.append(avg_l)
+                    avg_eps_r.append(avg_r)
             
-            plt.figure(figsize=(10, 6))
-            plt.plot(valid_epochs, avg_eps, marker='^', color='purple')
-            plt.title('Average Adaptive Epsilon per Epoch')
-            plt.xlabel('Epoch')
-            plt.ylabel('Epsilon')
-            plt.yscale('log')
-            plt.grid(True)
-            plt.savefig(os.path.join(self.save_dir, 'epsilon_evolution.png'))
-            plt.close()
+            if valid_epochs:
+                plt.figure(figsize=(10, 6))
+                plt.plot(valid_epochs, avg_eps_l, marker='^', color='blue', label='Epsilon L')
+                plt.plot(valid_epochs, avg_eps_r, marker='v', color='orange', label='Epsilon R')
+                plt.title('Average Adaptive Epsilon per Epoch (L vs R)')
+                plt.xlabel('Epoch')
+                plt.ylabel('Epsilon')
+                plt.yscale('log')
+                plt.grid(True, which="both", ls="-")
+                plt.legend()
+                plt.savefig(os.path.join(self.save_dir, 'epsilon_evolution.png'))
+                plt.close()
 
         # 5. Eigendecomposition Time
         if self.epoch_eigh_times:
@@ -416,6 +493,18 @@ class ShampooMonitor:
             plt.grid(True)
             plt.tight_layout()
             plt.savefig(os.path.join(self.save_dir, 'eigh_time_evolution.png'))
+            plt.close()
+        
+        # 6. [Added] Epoch Time Evolution
+        if self.epoch_times:
+            plt.figure(figsize=(10, 6))
+            plt.plot(self.epochs, self.epoch_times, label='Epoch Time', marker='o', color='brown')
+            plt.title('Epoch Wall-Clock Time Evolution')
+            plt.xlabel('Epoch')
+            plt.ylabel('Time (seconds)')
+            plt.grid(True)
+            plt.legend()
+            plt.savefig(os.path.join(self.save_dir, 'epoch_time_evolution.png'))
             plt.close()
         
         self.save_heatmap_plots()
@@ -918,7 +1007,7 @@ def train(args: argparse.Namespace):
         max_epsilon=args.max_epsilon
     )
 
-    monitor = ShampooMonitor(save_dir=args.log_dir, rank=global_rank)
+    monitor = ShampooMonitor(save_dir=args.log_dir, rank=global_rank, world_size=world_size) # Modified: passed world_size
     monitor.register_param_names(model, optimizer)
     current_epoch_ref = {'epoch': 0}
     patch_shampoo_optimizer(optimizer, monitor, lambda: current_epoch_ref['epoch'], eigh_monitor)
@@ -1020,8 +1109,10 @@ def train(args: argparse.Namespace):
                 r_update_pct = (stats['R_updated'] / stats['R_total']) * 100
 
         if global_rank == 0:
-            print(f"Epoch {epoch+1}: Train Loss (Full) {full_train_loss:.4f}, Val Acc {val_acc:.2f}%, Val Loss {avg_val_loss:.4f}")
-            monitor.log_metric(epoch + 1, full_train_loss, avg_val_loss, val_acc)
+            # [Added] Added Time to print
+            print(f"Epoch {epoch+1}: Train Loss (Full) {full_train_loss:.4f}, Val Acc {val_acc:.2f}%, Val Loss {avg_val_loss:.4f}, Time {epoch_duration:.2f}s")
+            # [Modified] Added epoch_duration
+            monitor.log_metric(epoch + 1, full_train_loss, avg_val_loss, val_acc, epoch_duration)
             
             # [UPDATED] WandB Logging (Epoch-level)
             wandb.log({
@@ -1051,6 +1142,12 @@ def train(args: argparse.Namespace):
                     'accuracy': val_acc
                 }, os.path.join(args.save_dir, f"vit_epoch_{epoch+1}.pth"))
             dist.barrier()
+
+    if global_rank == 0:
+        print("Gathering statistics from all ranks...")
+    
+    # [Added] Gather stats from all ranks
+    monitor.gather_stats()
 
     if global_rank == 0:
         monitor.save_plots()

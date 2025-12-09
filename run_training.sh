@@ -13,11 +13,14 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 # 사용할 GPU 개수 (시스템에 맞게 설정)
 N_GPUS=4
 
+WANDB_PROJECT="DryShampoo-ViT"
+RUN_NAME="vit_shampoo_${EPSILON_DESC}_LR${BASE_LR}_WD${WEIGHT_DECAY}_B1${BETA1}_$(date +%Y%m%d_%H%M%S)"
+
 # 데이터셋을 캐시할 경로 (절대 경로 권장)
 DATA_PATH="$HOME/.cache/huggingface/datasets"
 
 # TensorBoard 로그 및 모델 체크포인트를 저장할 기본 경로
-OUTPUT_DIR="./training_output_1128"
+OUTPUT_DIR="./training_output_1208"
 
 # Python 스크립트 파일 이름
 SCRIPT_NAME="vit.py"
@@ -28,9 +31,9 @@ BATCH_SIZE_PER_GPU=256 # GPU 메모리에 맞춰 조절
 WORKERS=4              # 데이터 로딩에 사용할 CPU 워커 수
 
 # 옵티마이저 및 스케줄러 하이퍼파라미터
-BASE_LR=0.00145
+BASE_LR=0.002
 WARMUP_STEPS=5634
-WEIGHT_DECAY=0.0005
+WEIGHT_DECAY=0.00042
 BETA1=0.95
 
 # 데이터 증강 하이퍼파라미터
@@ -56,10 +59,10 @@ echo "========================================================"
 
 if [ "$EPSILON_PRESET" == "default" ]; then
     echo "Selected Preset: DEFAULT"
-    echo "  - All matrices use same epsilon: 1e-10"
+    echo "  - All matrices use same epsilon: 1e-09"
     echo "  - Non-adaptive (fixed epsilon)"
-    echo "  - Left Matrix Epsilon: 1e-08"
-    echo "  - Right Matrix Epsilon: 1e-08"
+    echo "  - Left Matrix Epsilon: 1e-09"
+    echo "  - Right Matrix Epsilon: 1e-09"
     echo "  - Adaptive Mode: DISABLED"
     EPSILON_DESC="default"
 elif [ "$EPSILON_PRESET" == "asymmetric" ]; then

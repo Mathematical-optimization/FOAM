@@ -24,6 +24,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 
+# [추가] WandB
+import wandb
+
 # Shampoo Optimizer Imports
 from optimizers.distributed_shampoo.distributed_shampoo import DistributedShampoo
 from optimizers.distributed_shampoo.shampoo_types import (
@@ -169,6 +172,9 @@ class ShampooMonitor:
             plt.grid(True)
             plt.tight_layout()
             plt.savefig(os.path.join(self.save_dir, 'training_curves.png'))
+            # [추가] WandB Plot Logging
+            if wandb.run is not None:
+                wandb.log({"plots/training_curve": wandb.Image(plt)})
             plt.close()
 
         if self.epoch_stats:
@@ -185,6 +191,8 @@ class ShampooMonitor:
             plt.legend()
             plt.grid(True)
             plt.savefig(os.path.join(self.save_dir, 'shampoo_update_percentage.png'))
+            if wandb.run is not None:
+                wandb.log({"plots/update_percentage": wandb.Image(plt)})
             plt.close()
 
         epochs = sorted(self.rc_history.keys())
@@ -200,6 +208,8 @@ class ShampooMonitor:
                 plt.title('Distribution of Relative Condition (RC) Numbers per Epoch')
                 plt.grid(True, axis='y')
                 plt.savefig(os.path.join(self.save_dir, 'rc_distribution.png'))
+                if wandb.run is not None:
+                    wandb.log({"plots/rc_distribution": wandb.Image(plt)})
             plt.close()
 
         if self.epsilon_history:
@@ -213,6 +223,8 @@ class ShampooMonitor:
             plt.yscale('log')
             plt.grid(True)
             plt.savefig(os.path.join(self.save_dir, 'epsilon_evolution.png'))
+            if wandb.run is not None:
+                wandb.log({"plots/epsilon_evolution": wandb.Image(plt)})
             plt.close()
 
         if self.epoch_eigh_times:
@@ -226,6 +238,8 @@ class ShampooMonitor:
             plt.grid(True)
             plt.tight_layout()
             plt.savefig(os.path.join(self.save_dir, 'eigh_time_evolution.png'))
+            if wandb.run is not None:
+                wandb.log({"plots/eigh_time_evolution": wandb.Image(plt)})
             plt.close()
 
 def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
@@ -486,6 +500,16 @@ def main(args):
     global_rank = dist.get_rank()
     world_size = dist.get_world_size()
     
+    # [추가] WandB 초기화 (Rank 0)
+    if global_rank == 0:
+        wandb.init(
+            project=args.project,
+            entity=args.entity,
+            name=args.run_name if args.run_name else f"conformer_lr{args.lr}_bs{args.batch_size}",
+            config=vars(args),
+            dir=args.checkpoint_dir
+        )
+
     set_seed_distributed(args.seed, global_rank)
     wall_clock_profiler.training_start_time = time.perf_counter()
 
@@ -645,6 +669,14 @@ def main(args):
             if batch_idx % args.log_interval == 0 and global_rank == 0:
                 print(f"Epoch [{epoch+1}/{args.epochs}], Step [{batch_idx}/{len(train_loader)}], "
                       f"Loss: {loss.item():.4f}, LR: {current_lr:.6f}")
+                
+                # [추가] WandB Batch Logging
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/lr": current_lr,
+                    "epoch": epoch,
+                    "global_step": global_step
+                })
 
         # Epoch End
         if global_rank == 0:
@@ -661,6 +693,13 @@ def main(args):
             dist.all_reduce(dist_eigh_time)
             avg_eigh_time = dist_eigh_time.item() / world_size
             monitor.log_eigh_time(epoch + 1, avg_eigh_time)
+            
+            # [추가] WandB Epoch Logging
+            wandb.log({
+                "train/epoch_avg_loss": avg_loss,
+                "shampoo/avg_eigh_time": avg_eigh_time,
+                "epoch": epoch + 1
+            })
 
         if (epoch + 1) % args.save_interval == 0:
             if global_rank == 0:
@@ -676,6 +715,8 @@ def main(args):
 
     if global_rank == 0:
         monitor.save_plots()
+        # [추가] WandB 종료
+        wandb.finish()
     cleanup()
 
 if __name__ == "__main__":
@@ -716,6 +757,11 @@ if __name__ == "__main__":
     parser.add_argument('--log-interval', type=int, default=50)
     parser.add_argument('--save-interval', type=int, default=5)
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
+    
+    # [추가] WandB Params
+    parser.add_argument('--project', type=str, default='conformer-shampoo', help='WandB project name')
+    parser.add_argument('--entity', type=str, default=None, help='WandB entity')
+    parser.add_argument('--run-name', type=str, default=None, help='WandB run name')
     
     args = parser.parse_args()
     os.makedirs(args.checkpoint_dir, exist_ok=True)

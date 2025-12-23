@@ -500,14 +500,14 @@ def train(args):
     train_loader = DataLoader(tokenized_train, batch_size=args.batch_size, sampler=train_sampler, num_workers=args.workers, pin_memory=True)
     val_loader = DataLoader(tokenized_val, batch_size=args.batch_size, num_workers=args.workers, pin_memory=True)
 
-    # 2. Model: Transformer-Big (Algoperf Spec)
+    # 2. Model: Transformer-small (Algoperf Spec)
     model = TransformerBig(
         ntoken=vocab_size, 
-        d_model=1024, 
-        nhead=16, 
-        d_hid=4096, 
-        nlayers=6, 
-        dropout=0.1
+        d_model=args.d_model,    # args 값 사용
+        nhead=args.nhead,        # args 값 사용
+        d_hid=args.d_hid,        # args 값 사용
+        nlayers=args.nlayers,    # args 값 사용
+        dropout=args.dropout     # args 값 사용
     ).to(local_rank)
     model = DDP(model, device_ids=[local_rank], broadcast_buffers = False)
 
@@ -621,8 +621,8 @@ def train(args):
             total_loss += loss.detach().item()
             
             if i % args.log_interval == 0 and global_rank == 0:
-                print(f"Epoch {epoch} | Step {i} | Loss {loss.item():.4f} | LR {lr:.6f}")
-                wandb.log({"train_loss": loss.item(), "lr": lr})
+                print(f"Epoch {epoch} | Step {i} | Loss {loss.detach().item():.4f} | LR {lr:.6f}")
+                wandb.log({"train_loss": loss.detach().item(), "lr": lr})
 
         epoch_duration = time.perf_counter() - epoch_start
         

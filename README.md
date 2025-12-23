@@ -27,7 +27,7 @@ It is recommended to set both hyperparameters ‘start-preconditioning-step’ a
 
 vit.py: Source code for training ViT + ImageNet using the Distributed Shampoo optimizer. 
 
-resnet.py: Source code for training Resnet-50 + ImageNet using the Distributed Shampoo optimizer.
+Transformer.py: Source code for training Transformer + WMT using the Distributed Shampoo optimizer.
 
 conformer.py: Source code for training conformer + Librispeech using the Distributed Shampoo optimizer.
 

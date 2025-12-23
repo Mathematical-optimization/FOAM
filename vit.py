@@ -270,14 +270,24 @@ class ShampooMonitor:
         if self.world_size <= 1:
             return
 
+        # [수정] 중첩된 defaultdict를 재귀적으로 일반 dict로 변환하는 헬퍼 함수
+        def recursive_to_dict(d):
+            if isinstance(d, defaultdict):
+                return {k: recursive_to_dict(v) for k, v in d.items()}
+            return d
+
         # 1. Epoch Stats
+        # epoch_stats는 1단계 깊이라서 dict()만 해도 내부 값이 일반 dict이므로 문제 없음
         local_epoch_stats = dict(self.epoch_stats)
         gathered_epoch_stats = [None for _ in range(self.world_size)]
         dist.all_gather_object(gathered_epoch_stats, local_epoch_stats)
 
         # 2. Block History
-        local_block_history = dict(self.block_history)
+        # [수정] 중첩된 lambda를 제거하기 위해 재귀적으로 dict로 변환
+        local_block_history = recursive_to_dict(self.block_history)
         gathered_block_history = [None for _ in range(self.world_size)]
+        
+        # 이제 모든 내부 객체가 일반 dict이므로 pickle 에러가 발생하지 않음
         dist.all_gather_object(gathered_block_history, local_block_history)
 
         if self.rank == 0:
@@ -936,9 +946,12 @@ def train(args: argparse.Namespace):
             loss.backward()
             optimizer.step()
             
+            loss_for_logging = loss.clone().detach()
+            dist.all_reduce(loss_for_logging, op=dist.ReduceOp.SUM)
+            avg_loss = loss_for_logging.item() / world_size
             if global_rank == 0 and (i + 1) % args.log_interval == 0:
-                print(f"Epoch [{epoch+1}/{args.epochs}] Step [{i+1}/{len(train_loader)}] Loss: {loss.item():.4f}")
-
+                print(f"Epoch [{epoch+1}/{args.epochs}] Step [{i+1}/{len(train_loader)}] Loss: {avg_loss:.4f}")
+            
         # Feature 4: Eigh Time Logging
         epoch_eigendecomp_time = wall_clock_profiler.get_stats("eigendecomposition").epoch_time
         dist_eigh_time = torch.tensor(epoch_eigendecomp_time).to(local_rank)
@@ -951,10 +964,14 @@ def train(args: argparse.Namespace):
         epoch_duration = time.perf_counter() - epoch_start_time
 
         # Feature 3: Full-batch Training Loss Calculation
-        if global_rank == 0:
-            print(f"Calculating Full-batch Training Loss for Epoch {epoch+1}...")
-        
-        full_train_loss = validate_on_trainset(model, train_loader, criterion, local_rank, global_rank, world_size)
+        full_train_loss = 0.0
+        if epoch == args.epochs - 1:
+            if global_rank == 0:
+                print(f"Calculating Full-batch Training Loss for Epoch {epoch+1}...")
+            full_train_loss = validate_on_trainset(model, train_loader, criterion, local_rank, global_rank, world_size)
+        else:
+            if global_rank == 0:
+                pass
         
         # Validation
         model.eval()
@@ -1015,6 +1032,7 @@ def train(args: argparse.Namespace):
             
             # WandB Logging
             wandb.log({
+                'train/iteration_loss': avg_loss,
                 'train_loss': full_train_loss,
                 'val_acc': val_acc,
                 'val_loss': avg_val_loss,
@@ -1070,8 +1088,8 @@ if __name__ == '__main__':
     parser.add_argument('--adam-grafting-beta2', type=float, default=0.995)
     parser.add_argument('--grafting-epsilon', type=float, default=1e-09)
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
-    parser.add_argument('--precondition-frequency', type=int, default=1)
-    parser.add_argument('--start-preconditioning-step', type=int, default=1)
+    parser.add_argument('--precondition-frequency', type=int, default=15)
+    parser.add_argument('--start-preconditioning-step', type=int, default=15)
     parser.add_argument('--mixup', type=float, default=0.2)
     parser.add_argument('--label-smoothing', type=float, default=0.1)
     parser.add_argument('--log-interval', type=int, default=20)
@@ -1079,7 +1097,7 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=str, default='')
     parser.add_argument('--seed', type=int, default=42)
 
-    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.5)
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.0)
     parser.add_argument('--max-epsilon', type=float, default=1e-07)
     parser.add_argument('--project', type=str, default='DryShampoo_Experiment_ViT')
     parser.add_argument('--entity', type=str, default = 'Kyunghun')

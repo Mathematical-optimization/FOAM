@@ -22,11 +22,11 @@ OUTPUT_DIR="./training_output_transformer"
 SCRIPT_NAME="Transformer.py"
 
 EPOCHS=100                  
-BATCH_SIZE_PER_GPU=256      
+BATCH_SIZE_PER_GPU=128      
 WORKERS=6                  
 
 BASE_LR=0.002              
-WARMUP_STEPS=4000          
+WARMUP_STEPS=79000          
 WEIGHT_DECAY=0.0001        
 BETA1=0.9                  
 

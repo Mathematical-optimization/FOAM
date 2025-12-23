@@ -7,10 +7,10 @@ set -e
 set -x
 
 # --- 사용자 설정 변수 ---
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export WANDB_MODE=disabled
 # 사용할 GPU 개수
-N_GPUS=2
+N_GPUS=4
 
 # 데이터셋을 캐시할 경로 (절대 경로 권장)
 DATA_PATH="$HOME/.cache/huggingface/datasets"
@@ -21,12 +21,12 @@ OUTPUT_DIR="./training_output_transformer"
 # Python 스크립트 파일 이름 (Transformer용으로 변경)
 SCRIPT_NAME="Transformer.py"
 
-EPOCHS=100                  
+EPOCHS=90                  
 BATCH_SIZE_PER_GPU=128      
 WORKERS=6                  
 
 BASE_LR=0.002              
-WARMUP_STEPS=79000          
+WARMUP_STEPS=39500          
 WEIGHT_DECAY=0.0001        
 BETA1=0.9                  
 
@@ -41,7 +41,7 @@ echo "========================================================"
 
 if [ "$EPSILON_PRESET" == "default" ]; then
     echo "Selected Preset: DEFAULT"
-    echo "  - All matrices use same epsilon: 1e-10"
+    echo "  - All matrices use same epsilon: 1e-09"
     echo "  - Adaptive Mode: DISABLED"
     EPSILON_DESC="default"
 elif [ "$EPSILON_PRESET" == "asymmetric" ]; then
@@ -102,7 +102,6 @@ echo "========================================================"
 echo "Starting training in 3 seconds..."
 sleep 3
 
-# 실행 명령어 (ViT 전용 인자 mixup, label-smoothing 제거됨)
 torchrun --standalone --nnodes=1 --nproc_per_node=$N_GPUS $SCRIPT_NAME \
     --data-path $DATA_PATH \
     --log-dir $LOG_PATH \
@@ -116,8 +115,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$N_GPUS $SCRIPT_NAME \
     --weight-decay $WEIGHT_DECAY \
     --beta1 $BETA1 \
     $EPSILON_OPTIONS \
-    --log-interval 50 \
-    --save-interval 5
+    --log-interval 100 \
+    --save-interval 10
 
 echo ""
 echo "========================================================"

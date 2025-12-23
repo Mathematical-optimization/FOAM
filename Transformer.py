@@ -509,7 +509,7 @@ def train(args):
         nlayers=6, 
         dropout=0.1
     ).to(local_rank)
-    model = DDP(model, device_ids=[local_rank])
+    model = DDP(model, device_ids=[local_rank], broadcast_buffers = False)
 
     # Eigh Monitoring Setup
     eigh_monitor = EighMonitor()
@@ -618,7 +618,7 @@ def train(args):
             loss.backward()
             optimizer.step()
             
-            total_loss += loss.item()
+            total_loss += loss.detach().item()
             
             if i % args.log_interval == 0 and global_rank == 0:
                 print(f"Epoch {epoch} | Step {i} | Loss {loss.item():.4f} | LR {lr:.6f}")
@@ -708,10 +708,10 @@ if __name__ == "__main__":
     parser.add_argument('--warmup-steps', type=int, default=4000)
     
     # Model Params (Transformer Big)
-    parser.add_argument('--d-model', type=int, default=1024)
-    parser.add_argument('--nhead', type=int, default=16)
-    parser.add_argument('--nlayers', type=int, default=6)
-    parser.add_argument('--d-hid', type=int, default=4096)
+    parser.add_argument('--d-model', type=int, default=256)
+    parser.add_argument('--nhead', type=int, default=4)
+    parser.add_argument('--nlayers', type=int, default=4)
+    parser.add_argument('--d-hid', type=int, default=1024)
     parser.add_argument('--dropout', type=float, default=0.1)
     
     # Shampoo Params

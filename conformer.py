@@ -575,7 +575,7 @@ def main(args):
         lr=args.lr,
         betas=(args.beta1, args.beta2),
         weight_decay=args.weight_decay,
-        epsilon=1e-10,
+        epsilon=1e-09,
         momentum=0.0,
         max_preconditioner_dim=args.max_preconditioner_dim,
         precondition_frequency=args.precondition_frequency,
@@ -712,7 +712,7 @@ if __name__ == "__main__":
     parser.add_argument('--encoder-dim', type=int, default=144, help="Conformer Small: 144")
     parser.add_argument('--num-layers', type=int, default=16, help="Conformer Small: 16") 
     parser.add_argument('--num-heads', type=int, default=4, help="Conformer Small: 4")
-    parser.add_argument('--depthwise-kernel-size', type=int, default=32)
+    parser.add_argument('--depthwise-kernel-size', type=int, default=31)
     
     # Training Params
     parser.add_argument('--epochs', type=int, default=90)

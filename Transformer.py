@@ -174,14 +174,13 @@ class ShampooMonitor:
     def save_plots(self):
         if self.rank != 0: return
         os.makedirs(self.save_dir, exist_ok=True)
-        # 여기에 필요한 Plotting 로직 추가 (RC Distribution 등)
-
+        
 # ========================================
 # 2. DryShampoo Logic Patch (Adaptive Epsilon)
 # ========================================
 
 def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
-    """DistributedShampoo에 DryShampoo 로직(적응형 Epsilon 등)을 주입"""
+    
     
     def patched_compute_single_root_inverse(
         self, factor_matrix, inv_factor_matrix, is_factor_matrix_diagonal,
@@ -320,14 +319,7 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 class TransformerBig(nn.Module):
-    """
-    Algoperf WMT Benchmark Spec (Transformer-Big):
-    - d_model: 1024
-    - dim_feedforward: 4096
-    - nhead: 16
-    - num_layers: 6 (encoder/decoder)
-    - Shared Embeddings (Source, Target, Output Projection)
-    """
+    
     def __init__(self, ntoken, d_model=1024, nhead=16, d_hid=4096, nlayers=6, dropout=0.1):
         super(TransformerBig, self).__init__()
         self.model_type = 'Transformer'
@@ -530,7 +522,7 @@ def train(args):
     )
     
     # Epsilon Config
-    epsilon_config = {'epsilon': 1e-10}
+    epsilon_config = {'epsilon': 1e-09}
     if args.epsilon_preset == 'asymmetric':
         epsilon_config = {'epsilon': 1e-10, 'epsilon_left': 1e-8, 'epsilon_right': 1e-8}
 
@@ -716,14 +708,14 @@ if __name__ == "__main__":
     
     # Shampoo Params
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
-    parser.add_argument('--precondition-frequency', type=int, default=10)
-    parser.add_argument('--start-preconditioning-step', type=int, default=10)
+    parser.add_argument('--precondition-frequency', type=int, default=50)
+    parser.add_argument('--start-preconditioning-step', type=int, default=50)
     parser.add_argument('--beta1', type=float, default=0.9)
     parser.add_argument('--beta2', type=float, default=0.999)
     parser.add_argument('--weight-decay', type=float, default=0.0001)
     
     # DryShampoo Params
-    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.1)
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.0)
     parser.add_argument('--max-epsilon', type=float, default=1e-6)
     parser.add_argument('--epsilon-preset', type=str, default='default', choices=['default', 'asymmetric'])
     

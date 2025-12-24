@@ -352,16 +352,18 @@ class AlgoPerfLibriSpeech(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        waveform, sample_rate, transcript, _, _, _ = self.dataset[idx]
+        try:
+            # 데이터 로딩 시도
+            waveform, sample_rate, transcript, _, _, _ = self.dataset[idx]
+        except Exception as e:
+            # 로딩 실패 시 에러 메시지 출력 후 None 반환 (학습 중단 방지)
+            print(f"Warning: Error loading sample at index {idx}. Skipping. Error: {e}")
+            return None
         
         if waveform.shape[1] > self.args.max_audio_length:
             return None
             
         spec = self.melspec(waveform)
-        spec = torch.log(spec + 1e-9)
-        
-        if self.train:
-            spec = self.spec_augment(spec)
         
         # (Freq, Time) -> (Time, Freq)
         return spec.squeeze(0).transpose(0, 1), transcript
@@ -571,24 +573,26 @@ def main(args):
     )
 
     optimizer = DistributedShampoo(
-        params=model.parameters(),
-        lr=args.lr,
-        betas=(args.beta1, args.beta2),
-        weight_decay=args.weight_decay,
-        epsilon=1e-09,
-        momentum=0.0,
-        max_preconditioner_dim=args.max_preconditioner_dim,
-        precondition_frequency=args.precondition_frequency,
-        start_preconditioning_step=args.start_preconditioning_step,
-        grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-8),
-        use_decoupled_weight_decay=True,
-        inv_root_override=2,
-        exponent_multiplier=1,
-        distributed_config=distributed_config,
-        preconditioner_dtype=torch.float32,
-        use_protected_eigh=True,
-        matrix_root_inv_threshold=0.0,
-    )
+    params=model.parameters(),
+    lr=args.lr,
+    betas=(args.beta1, args.beta2),
+    weight_decay=args.weight_decay,
+    epsilon=1e-09, 
+    momentum=0.0,
+    max_preconditioner_dim=args.max_preconditioner_dim,
+    precondition_frequency=args.precondition_frequency,
+    start_preconditioning_step=args.start_preconditioning_step,
+    grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-8),
+    use_decoupled_weight_decay=True,
+    inv_root_override=2,
+    exponent_multiplier=1,
+    distributed_config=distributed_config,
+    preconditioner_dtype=torch.float32,
+    use_protected_eigh=True,
+
+    matrix_root_inv_threshold=args.matrix_root_inv_threshold, 
+    max_epsilon=args.max_epsilon 
+)
 
     monitor = ShampooMonitor(save_dir='logs_conformer', rank=global_rank)
     monitor.register_param_names(model, optimizer)
@@ -730,6 +734,8 @@ if __name__ == "__main__":
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
     parser.add_argument('--precondition-frequency', type=int, default=100)
     parser.add_argument('--start-preconditioning-step', type=int, default=100)
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.0)
+    parser.add_argument('--max-epsilon', type=float, default=1e-7)
     
     # Logistics
     parser.add_argument('--log-interval', type=int, default=50)

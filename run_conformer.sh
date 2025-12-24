@@ -19,7 +19,7 @@ export WANDB_MODE=online
 
 # 경로 설정
 # 데이터셋 경로 (LibriSpeech 데이터가 저장될 위치)
-DATA_PATH="./data"
+DATA_PATH="/workspace/datasets"
 # SentencePiece 모델 경로 (conformer.py 실행 전 생성 필요)
 SPM_MODEL_PATH="spm_librispeech_1024.model"
 
@@ -31,14 +31,14 @@ SCRIPT_NAME="conformer.py"
 
 # 학습 기본 하이퍼파라미터 (Conformer Small 설정 기준)
 EPOCHS=90
-BATCH_SIZE_PER_GPU=32  # GPU 메모리에 맞춰 조절
+BATCH_SIZE_PER_GPU=256  # GPU 메모리에 맞춰 조절
 WORKERS=4              # 데이터 로딩 워커 수
 
 # 옵티마이저 및 스케줄러 하이퍼파라미터
-LR=0.002
-WARMUP_STEPS=10000
-WEIGHT_DECAY=1e-6
-BETA1=0.9
+LR=0.0002
+WARMUP_STEPS=5000
+WEIGHT_DECAY=1e-5
+BETA1=0.95
 BETA2=0.98
 
 # Shampoo 하이퍼파라미터

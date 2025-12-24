@@ -8,25 +8,26 @@ set -x
 
 # --- 사용자 설정 변수 ---
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export WANDB_MODE=disabled
+export WANDB_API_KEY="37d143039a17dfe05b4e0e5314eccaae6016efd0"
+export WANDB_MODE=online
 # 사용할 GPU 개수
 N_GPUS=4
 
 # 데이터셋을 캐시할 경로 (절대 경로 권장)
-DATA_PATH="$HOME/.cache/huggingface/datasets"
+DATA_PATH="/workspace/datasets"
 
 # TensorBoard 로그 및 모델 체크포인트를 저장할 기본 경로
-OUTPUT_DIR="./training_output_transformer"
+OUTPUT_DIR="./training_output_transformer_1223"
 
 # Python 스크립트 파일 이름 (Transformer용으로 변경)
 SCRIPT_NAME="Transformer.py"
 
-EPOCHS=90                  
+EPOCHS=60                  
 BATCH_SIZE_PER_GPU=128      
 WORKERS=6                  
 
 BASE_LR=0.002              
-WARMUP_STEPS=39500          
+WARMUP_STEPS=26400          
 WEIGHT_DECAY=0.0001        
 BETA1=0.9                  
 

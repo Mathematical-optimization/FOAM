@@ -125,11 +125,12 @@ class ShampooMonitor:
         self.train_losses = []
         self.epochs = []
         
-        # DryShampoo Stats
+        # DryShampoo Stats [Updated]
         self.epoch_stats = defaultdict(lambda: {'L_updated': 0, 'L_total': 0, 'R_updated': 0, 'R_total': 0})
         self.epoch_eigh_times = {}
         self.rc_history = defaultdict(list)
-        self.epsilon_history = defaultdict(list)
+        # Epsilon History를 L과 R로 구분하여 저장하도록 수정
+        self.epsilon_history = defaultdict(lambda: {'L': [], 'R': []})
         self.param_index_to_name = {}
 
     def register_param_names(self, model, optimizer):
@@ -146,19 +147,39 @@ class ShampooMonitor:
         self.train_losses.append(train_loss)
 
     def log_update(self, epoch, param_idx, dim_idx, updated, rc_value, epsilon_value):
-        if self.rank != 0: return
+        # 통계 수집은 모든 rank에서 수행하고 나중에 reduce 할 수 있도록 rank check 제거 또는 유지
+        # 여기서는 vit.py 구조를 따라감
+        
         key_prefix = 'L' if dim_idx == 0 else 'R'
         self.epoch_stats[epoch][f'{key_prefix}_total'] += 1
         if updated:
             self.epoch_stats[epoch][f'{key_prefix}_updated'] += 1
+        
         if rc_value is not None:
             self.rc_history[epoch].append(rc_value)
         if epsilon_value is not None:
-            self.epsilon_history[epoch].append(epsilon_value)
+            self.epsilon_history[epoch][key_prefix].append(epsilon_value)
 
     def log_eigh_time(self, epoch, time_sec):
         if self.rank != 0: return
         self.epoch_eigh_times[epoch] = time_sec
+
+    # [NEW] vit.py에서 가져온 집계 함수 추가
+    def get_local_epoch_data(self, epoch):
+        stats = self.epoch_stats[epoch]
+        eps_dict = self.epsilon_history[epoch]
+        
+        sum_l = sum(eps_dict['L']) if eps_dict['L'] else 0.0
+        len_l = len(eps_dict['L'])
+        sum_r = sum(eps_dict['R']) if eps_dict['R'] else 0.0
+        len_r = len(eps_dict['R'])
+
+        return torch.tensor([
+            stats['L_updated'], stats['R_updated'],
+            sum_l, len_l,
+            sum_r, len_r,
+            stats['L_total'], stats['R_total'] 
+        ], dtype=torch.float64)
 
     def save_plots(self):
         if self.rank != 0: return
@@ -209,7 +230,7 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                 )
                 rc_val_to_log = rc_t.item()
 
-                # 2. Calculate Alpha (Spectral Norm / Frobenius Norm of H) - [FIX] 추가됨
+                # 2. Calculate Alpha (Spectral Norm / Frobenius Norm of H)
                 inv_root_exponent = -self._exponent_multiplier / root
                 h_eigenvalues = (prev_D + current_epsilon).pow(inv_root_exponent)
                 
@@ -217,7 +238,7 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                 frobenius_norm = torch.norm(h_eigenvalues, p=2)
                 alpha = spectral_norm / (frobenius_norm + 1e-25)
 
-                # 3. Propose New Epsilon - [FIX] alpha 반영
+                # 3. Propose New Epsilon
                 new_epsilon = current_epsilon * ((rc_t * alpha) / self._matrix_root_inv_threshold)
                 
                 # 4. Condition Check
@@ -711,9 +732,31 @@ def main(args):
             avg_eigh_time = dist_eigh_time.item() / world_size
             monitor.log_eigh_time(epoch + 1, avg_eigh_time)
             
+            # [FIXED] vit.py 스타일의 상세 DryShampoo 지표 수집 및 로깅
+            local_stats = monitor.get_local_epoch_data(epoch).to(local_rank)
+            dist.all_reduce(local_stats, op=dist.ReduceOp.SUM)
+            
+            l_up, r_up = int(local_stats[0]), int(local_stats[1])
+            sum_eps_l, len_eps_l = local_stats[2], local_stats[3]
+            sum_eps_r, len_eps_r = local_stats[4], local_stats[5]
+            l_tot, r_tot = int(local_stats[6]), int(local_stats[7])
+            
+            l_pct = (l_up / l_tot * 100) if l_tot > 0 else 0
+            r_pct = (r_up / r_tot * 100) if r_tot > 0 else 0
+            
+            avg_eps_l = sum_eps_l / max(1, len_eps_l)
+            avg_eps_r = sum_eps_r / max(1, len_eps_r)
+
+            print(f"    DryShampoo Updates (L/R): {l_pct:.1f}% / {r_pct:.1f}%")
+            print(f"    Avg Epsilon (L/R): {avg_eps_l:.2e} / {avg_eps_r:.2e}")
+            
             wandb.log({
                 "train/epoch_avg_loss": avg_loss,
                 "shampoo/avg_eigh_time": avg_eigh_time,
+                "shampoo/L_update_pct": l_pct,
+                "shampoo/R_update_pct": r_pct,
+                "shampoo/avg_epsilon_L": avg_eps_l,
+                "shampoo/avg_epsilon_R": avg_eps_r,
                 "epoch": epoch + 1
             })
 
@@ -780,7 +823,7 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
     
     # WandB Params
-    parser.add_argument('--project', type=str, default='conformer-shampoo', help='WandB project name')
+    parser.add_argument('--project', type=str, default='conformer-dryshampoo', help='WandB project name')
     parser.add_argument('--entity', type=str, default=None, help='WandB entity')
     parser.add_argument('--run-name', type=str, default=None, help='WandB run name')
     

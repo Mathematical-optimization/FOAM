@@ -6,7 +6,6 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
@@ -180,6 +179,10 @@ class ShampooMonitor:
             plt.close()
 
 def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
+    """
+    DistributedShampoo에 DryShampoo 로직(적응형 Epsilon 및 Fast Update)을 주입합니다.
+    """
+    
     def patched_compute_single_root_inverse(
         self, factor_matrix, inv_factor_matrix, is_factor_matrix_diagonal,
         factor_matrix_index, root, epsilon_value, kronecker_factors, factor_idx
@@ -197,36 +200,57 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
         should_recompute_eigen = True
         rc_val_to_log = None 
 
+        # DryShampoo Algorithm 3: Check conditions if we have stale eigenbases
         if prev_Q is not None and prev_D is not None and self._matrix_root_inv_threshold > 0.0:
             try:
+                # 1. Compute RC (Relative Condition Number)
                 rc_t = self._compute_relative_condition_number(
                     bias_corrected_factor_matrix, prev_Q, prev_D, current_epsilon
                 )
                 rc_val_to_log = rc_t.item()
-                new_epsilon = current_epsilon * (rc_t / self._matrix_root_inv_threshold)
+
+                # 2. Calculate Alpha (Spectral Norm / Frobenius Norm of H) - [FIX] 추가됨
+                inv_root_exponent = -self._exponent_multiplier / root
+                h_eigenvalues = (prev_D + current_epsilon).pow(inv_root_exponent)
                 
-                if rc_t >= self._matrix_root_inv_threshold:
+                spectral_norm = h_eigenvalues.abs().max()
+                frobenius_norm = torch.norm(h_eigenvalues, p=2)
+                alpha = spectral_norm / (frobenius_norm + 1e-25)
+
+                # 3. Propose New Epsilon - [FIX] alpha 반영
+                new_epsilon = current_epsilon * ((rc_t * alpha) / self._matrix_root_inv_threshold)
+                
+                # 4. Condition Check
+                if (rc_t * alpha) >= self._matrix_root_inv_threshold:
                     if new_epsilon < self._max_epsilon:
+                        # Fast Update with increased epsilon
                         current_epsilon = float(new_epsilon)
                         should_recompute_eigen = False
-                        alpha = -self._exponent_multiplier / root
-                        eig_term = (prev_D + current_epsilon).pow(alpha)
+                        
+                        alpha_pow = -self._exponent_multiplier / root
+                        eig_term = (prev_D + current_epsilon).pow(alpha_pow)
                         computed_inv_factor_matrix = prev_Q * eig_term.unsqueeze(0) @ prev_Q.T
+                        
                         computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype=inv_factor_matrix.dtype)
                         inv_factor_matrix.copy_(computed_inv_factor_matrix)
                         kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon
                     else:
+                        # Very Unstable -> Slow Update (Full Eigen) with base epsilon
                         current_epsilon = epsilon_value
                         should_recompute_eigen = True 
                 else:
+                    # Stable -> Fast Update
                     current_epsilon = float(new_epsilon)
                     should_recompute_eigen = False
-                    alpha = -self._exponent_multiplier / root
-                    eig_term = (prev_D + current_epsilon).pow(alpha)
+                    
+                    alpha_pow = -self._exponent_multiplier / root
+                    eig_term = (prev_D + current_epsilon).pow(alpha_pow)
                     computed_inv_factor_matrix = prev_Q * eig_term.unsqueeze(0) @ prev_Q.T
+                    
                     computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype=inv_factor_matrix.dtype)
                     inv_factor_matrix.copy_(computed_inv_factor_matrix)
                     kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon
+
             except Exception:
                 should_recompute_eigen = True
 
@@ -242,11 +266,15 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                     is_diagonal=is_factor_matrix_diagonal,
                     retry_double_precision=self._use_protected_eigh,
                 )
-                computed_inv_factor_matrix, _, L, Q = result
+                computed_inv_factor_matrix, used_epsilon, L, Q = result
+                
                 if L is not None and Q is not None:
-                    kronecker_factors.eigenvalues[factor_idx] = L.to(dtype=factor_matrix.dtype)
+                    # Store Raw Eigenvalues (L - epsilon) for next step
+                    raw_eigenvalues = L - used_epsilon
+                    kronecker_factors.eigenvalues[factor_idx] = raw_eigenvalues.to(dtype=factor_matrix.dtype)
                     kronecker_factors.eigenvectors[factor_idx] = Q.to(dtype=factor_matrix.dtype)
                     kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon
+                
                 computed_inv_factor_matrix = computed_inv_factor_matrix.to(dtype=inv_factor_matrix.dtype)
                 inv_factor_matrix.copy_(computed_inv_factor_matrix)
             except Exception:
@@ -264,6 +292,7 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
         except Exception:
             pass
 
+    # Patch the class method
     from optimizers.distributed_shampoo.utils.shampoo_preconditioner_list import ShampooPreconditionerList
     ShampooPreconditionerList._compute_single_root_inverse = patched_compute_single_root_inverse
 
@@ -329,6 +358,7 @@ class AlgoPerfLibriSpeech(Dataset):
         self.args = args
         
         if self.train:
+            # 전체 학습을 위해서는 ds1, ds2, ds3 모두 사용 권장
             ds1 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-clean-100", download=download)
             ds2 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-clean-360", download=download)
             ds3 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-other-500", download=download)
@@ -343,6 +373,7 @@ class AlgoPerfLibriSpeech(Dataset):
             n_mels=args.n_mels
         )
         
+        # SpecAugment
         self.spec_augment = nn.Sequential(
             torchaudio.transforms.TimeMasking(time_mask_param=35),
             torchaudio.transforms.FrequencyMasking(freq_mask_param=27)
@@ -357,13 +388,17 @@ class AlgoPerfLibriSpeech(Dataset):
             waveform, sample_rate, transcript, _, _, _ = self.dataset[idx]
         except Exception as e:
             # 로딩 실패 시 에러 메시지 출력 후 None 반환 (학습 중단 방지)
-            print(f"Warning: Error loading sample at index {idx}. Skipping. Error: {e}")
+            # print(f"Warning: Error loading sample at index {idx}. Skipping. Error: {e}")
             return None
         
         if waveform.shape[1] > self.args.max_audio_length:
             return None
             
         spec = self.melspec(waveform)
+        
+        # Train 모드일 때만 SpecAugment 적용
+        if self.train:
+            spec = self.spec_augment(spec)
         
         # (Freq, Time) -> (Time, Freq)
         return spec.squeeze(0).transpose(0, 1), transcript
@@ -398,7 +433,7 @@ def get_collate_fn(tokenizer):
 
 class ConformerAlgoPerf(nn.Module):
     """
-    ALGOPERF 벤치마크 및 원본 논문의 Conformer 구조 구현 [cite: 2290, 2361]
+    ALGOPERF 벤치마크 및 원본 논문의 Conformer 구조 구현
     - Convolution Subsampling 포함
     - Linear Projection 포함
     - Conformer Encoder + CTC Head
@@ -406,7 +441,7 @@ class ConformerAlgoPerf(nn.Module):
     def __init__(self, num_classes, input_dim=80, encoder_dim=144, num_layers=16, num_heads=4, depthwise_kernel_size=32):
         super(ConformerAlgoPerf, self).__init__()
         
-        # [수정 1] Convolution Subsampling (Stride 4) [cite: 2361]
+        # Convolution Subsampling (Stride 4)
         # 입력: (Batch, 1, Time, Freq)
         # Conv1: (1, dim, 3, 2) -> (Batch, dim, T/2, F/2)
         # Conv2: (dim, dim, 3, 2) -> (Batch, dim, T/4, F/4)
@@ -422,7 +457,7 @@ class ConformerAlgoPerf(nn.Module):
         flattened_dim = encoder_dim * (((input_dim - 1) // 2 + 1 - 1) // 2 + 1)
         self.input_projection = nn.Linear(flattened_dim, encoder_dim)
 
-        # [수정 2] Conformer 차원 설정 (encoder_dim 사용) 
+        # Conformer 차원 설정 (encoder_dim 사용) 
         self.conformer = torchaudio.models.Conformer(
             input_dim=encoder_dim,  # input_dim 80이 아닌 인코더 차원(144)을 입력받음
             num_heads=num_heads,
@@ -436,7 +471,7 @@ class ConformerAlgoPerf(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # [cite: 1933] "Model weights are initialized using Xavier uniform initialization"
+        # "Model weights are initialized using Xavier uniform initialization"
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
@@ -493,7 +528,7 @@ def main(args):
     if global_rank == 0:
         print(f"Training Config: {args}")
         print(f"World Size: {world_size}, Local Rank: {local_rank}")
-        print(f"Model Architecture: Conformer Small (10M Params) - ")
+        print(f"Model Architecture: Conformer Small (10M Params)")
 
     if global_rank == 0:
         if not os.path.exists(args.data_path):
@@ -505,7 +540,7 @@ def main(args):
         # torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-other-500", download=True)  
     dist.barrier()
 
-    # [수정] Tokenizer 설정
+    # Tokenizer 설정
     if global_rank == 0 and not os.path.exists(args.spm_model_path):
         print(f"Warning: SPM model not found at {args.spm_model_path}. Assuming user will provide.")
     tokenizer = SentencePieceTransform(args.spm_model_path)
@@ -529,7 +564,7 @@ def main(args):
         drop_last=True
     )
 
-    # [수정] 모델 파라미터 적용 (Conformer Small 기준)
+    # 모델 파라미터 적용 (Conformer Small 기준)
     model = ConformerAlgoPerf(
         num_classes=len(tokenizer),
         input_dim=args.n_mels,
@@ -541,7 +576,7 @@ def main(args):
 
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
-    # Logging & Monitor Setup (기존 유지)
+    # Logging & Monitor Setup
     eigh_fallback_handler = EighFallbackCounter()
     matrix_logger = logging.getLogger('optimizers.matrix_functions')
     matrix_logger.setLevel(logging.WARNING)
@@ -573,26 +608,26 @@ def main(args):
     )
 
     optimizer = DistributedShampoo(
-    params=model.parameters(),
-    lr=args.lr,
-    betas=(args.beta1, args.beta2),
-    weight_decay=args.weight_decay,
-    epsilon=1e-09, 
-    momentum=0.0,
-    max_preconditioner_dim=args.max_preconditioner_dim,
-    precondition_frequency=args.precondition_frequency,
-    start_preconditioning_step=args.start_preconditioning_step,
-    grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-8),
-    use_decoupled_weight_decay=True,
-    inv_root_override=2,
-    exponent_multiplier=1,
-    distributed_config=distributed_config,
-    preconditioner_dtype=torch.float32,
-    use_protected_eigh=True,
-
-    matrix_root_inv_threshold=args.matrix_root_inv_threshold, 
-    max_epsilon=args.max_epsilon 
-)
+        params=model.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        weight_decay=args.weight_decay,
+        epsilon=1e-09, 
+        momentum=0.0,
+        max_preconditioner_dim=args.max_preconditioner_dim,
+        precondition_frequency=args.precondition_frequency,
+        start_preconditioning_step=args.start_preconditioning_step,
+        grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-8),
+        use_decoupled_weight_decay=True,
+        inv_root_override=2,
+        exponent_multiplier=1,
+        distributed_config=distributed_config,
+        preconditioner_dtype=torch.float32,
+        use_protected_eigh=True,
+        # DryShampoo Params
+        matrix_root_inv_threshold=args.matrix_root_inv_threshold, 
+        max_epsilon=args.max_epsilon 
+    )
 
     monitor = ShampooMonitor(save_dir='logs_conformer', rank=global_rank)
     monitor.register_param_names(model, optimizer)
@@ -734,8 +769,10 @@ if __name__ == "__main__":
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
     parser.add_argument('--precondition-frequency', type=int, default=100)
     parser.add_argument('--start-preconditioning-step', type=int, default=100)
+    # DryShampoo Params
     parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.0)
     parser.add_argument('--max-epsilon', type=float, default=1e-7)
+    parser.add_argument('--epsilon-preset', type=str, default='default', choices=['default', 'asymmetric'])
     
     # Logistics
     parser.add_argument('--log-interval', type=int, default=50)

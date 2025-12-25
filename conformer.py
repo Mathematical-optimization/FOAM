@@ -359,12 +359,12 @@ class AlgoPerfLibriSpeech(Dataset):
         
         if self.train:
             # 전체 학습을 위해서는 ds1, ds2, ds3 모두 사용 권장
-            ds1 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-clean-100", download=download)
-            ds2 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-clean-360", download=download)
-            ds3 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-other-500", download=download)
+            ds1 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-clean-100", download=True)
+            ds2 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-clean-360", download=True)
+            ds3 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-other-500", download=True)
             self.dataset = ConcatDataset([ds1, ds2, ds3])
         else:
-            self.dataset = torchaudio.datasets.LIBRISPEECH(root=root, url=url, download=download)
+            self.dataset = torchaudio.datasets.LIBRISPEECH(root=root, url=url, download=True)
         
         self.melspec = torchaudio.transforms.MelSpectrogram(
             sample_rate=args.sample_rate,
@@ -536,8 +536,8 @@ def main(args):
         print("Downloading Librispeech datasets...")
         torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-clean-100", download=True)
         # 필요한 경우 주석 해제 (전체 학습 시)
-        # torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-clean-360", download=True)
-        # torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-other-500", download=True)  
+        torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-clean-360", download=True)
+        torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-other-500", download=True)  
     dist.barrier()
 
     # Tokenizer 설정
@@ -617,7 +617,7 @@ def main(args):
         max_preconditioner_dim=args.max_preconditioner_dim,
         precondition_frequency=args.precondition_frequency,
         start_preconditioning_step=args.start_preconditioning_step,
-        grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-8),
+        grafting_config=AdamGraftingConfig(beta2=args.beta2, epsilon=1e-9),
         use_decoupled_weight_decay=True,
         inv_root_override=2,
         exponent_multiplier=1,
@@ -755,20 +755,20 @@ if __name__ == "__main__":
     
     # Training Params
     parser.add_argument('--epochs', type=int, default=90)
-    parser.add_argument('--batch-size', type=int, default=32, help='Per-GPU batch size')
+    parser.add_argument('--batch-size', type=int, default=256, help='Per-GPU batch size')
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--lr', type=float, default=0.002)
-    parser.add_argument('--warmup-steps', type=int, default=10000)
-    parser.add_argument('--weight-decay', type=float, default=1e-6)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--warmup-steps', type=int, default=4600)
+    parser.add_argument('--weight-decay', type=float, default=5e-5)
     parser.add_argument('--grad-clip', type=float, default=1.0)
-    parser.add_argument('--beta1', type=float, default=0.9)
-    parser.add_argument('--beta2', type=float, default=0.98) 
+    parser.add_argument('--beta1', type=float, default=0.95)
+    parser.add_argument('--beta2', type=float, default=0.99) 
     
     # Shampoo Params
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
-    parser.add_argument('--precondition-frequency', type=int, default=100)
-    parser.add_argument('--start-preconditioning-step', type=int, default=100)
+    parser.add_argument('--precondition-frequency', type=int, default=50)
+    parser.add_argument('--start-preconditioning-step', type=int, default=50)
     # DryShampoo Params
     parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.0)
     parser.add_argument('--max-epsilon', type=float, default=1e-7)

@@ -427,7 +427,7 @@ class AlgoPerfLibriSpeech(Dataset):
             except Exception as e:
                 # 로딩 실패 시 다른 인덱스로 재시도
                 idx = random.randint(0, len(self.dataset) - 1)
-                
+
 def get_collate_fn(tokenizer):
     def collate_fn(batch):
         batch = [item for item in batch if item is not None]
@@ -696,11 +696,16 @@ def main(args):
             outputs, output_lengths = model(spectrograms, input_lengths)
             loss = criterion(outputs, labels, output_lengths, label_lengths)
             
+            is_invalid = torch.tensor(0.0, device= local_rank)
             if torch.isnan(loss) or torch.isinf(loss):
+                is_invalid = torch.tensor(1.0, device = local_rank)
+            
+            dist.all_reduce(is_invalid, op = dist.ReduceOp.SUM)
+            if is_invalid > 0:
                 if global_rank == 0:
-                    print(f"Warning: NaN/Inf loss at step {global_step}. Skipping.")
-                continue
-
+                    print(f"Warning : NaN/Inf loss detected on one or more ranks at step {global_step}. Skipping step globally ")
+                    continue
+                    
             loss.backward()
             
             if args.grad_clip > 0:

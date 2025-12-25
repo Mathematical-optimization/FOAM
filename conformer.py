@@ -404,26 +404,30 @@ class AlgoPerfLibriSpeech(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        try:
-            # 데이터 로딩 시도
-            waveform, sample_rate, transcript, _, _, _ = self.dataset[idx]
-        except Exception as e:
-            # 로딩 실패 시 에러 메시지 출력 후 None 반환 (학습 중단 방지)
-            # print(f"Warning: Error loading sample at index {idx}. Skipping. Error: {e}")
-            return None
-        
-        if waveform.shape[1] > self.args.max_audio_length:
-            return None
-            
-        spec = self.melspec(waveform)
-        
-        # Train 모드일 때만 SpecAugment 적용
-        if self.train:
-            spec = self.spec_augment(spec)
-        
-        # (Freq, Time) -> (Time, Freq)
-        return spec.squeeze(0).transpose(0, 1), transcript
+        # 유효한 데이터를 찾을 때까지 반복 (재귀 호출 대신 while문 권장)
+        while True:
+            try:
+                # 데이터 로딩 시도
+                waveform, sample_rate, transcript, _, _, _ = self.dataset[idx]
+                
+                # 길이가 너무 긴 경우 패스하고 다른 데이터 찾기
+                if waveform.shape[1] > self.args.max_audio_length:
+                    idx = random.randint(0, len(self.dataset) - 1)
+                    continue
 
+                spec = self.melspec(waveform)
+                
+                # Train 모드일 때만 SpecAugment 적용
+                if self.train:
+                    spec = self.spec_augment(spec)
+                
+                # (Freq, Time) -> (Time, Freq)
+                return spec.squeeze(0).transpose(0, 1), transcript
+
+            except Exception as e:
+                # 로딩 실패 시 다른 인덱스로 재시도
+                idx = random.randint(0, len(self.dataset) - 1)
+                
 def get_collate_fn(tokenizer):
     def collate_fn(batch):
         batch = [item for item in batch if item is not None]

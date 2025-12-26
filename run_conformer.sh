@@ -9,7 +9,6 @@ set -x
 # --- 사용자 설정 변수 ---
 # 사용할 GPU ID 설정
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export WANDB_API_KEY="37d143039a17dfe05b4e0e5314eccaae6016efd0"
 # 사용할 GPU 개수
 N_GPUS=4
 

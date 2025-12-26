@@ -239,7 +239,7 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
 
                 spectral_norm = h_eigenvalues.abs().max()
                 frobenius_norm = torch.norm(h_eigenvalues, p=2)
-                alpha = spectral_norm / (frobenius_norm + 1e-25)
+                alpha = spectral_norm / (frobenius_norm + 1e-20)
 
                 new_epsilon = current_epsilon * ((rc_t * alpha) / self._matrix_root_inv_threshold)
 
@@ -395,9 +395,6 @@ class AlgoPerfLibriSpeech(Dataset):
         self.args = args
 
         if self.train:
-            # ★ 중요: 멀티-rank에서 download=True로 두면 각 rank가 동시에 내려받으려 하면서
-            # I/O가 꼬이거나 stall이 날 수 있습니다. main에서 rank0가 미리 다운로드했다고 가정하고
-            # 여기서는 download=False를 권장합니다.
             ds1 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-clean-100", download=download)
             ds2 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-clean-360", download=download)
             ds3 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-other-500", download=download)
@@ -555,7 +552,7 @@ def main(args):
         print(f"World Size: {world_size}, Local Rank: {local_rank}")
         print(f"Model Architecture: Conformer Small (10M Params)")
 
-    # ---- 데이터셋 다운로드는 rank0에서만, 그리고 학습에 쓰는 3개 split을 모두 받아두는 걸 권장 ----
+    
     if global_rank == 0:
         os.makedirs(args.data_path, exist_ok=True)
         print("Downloading Librispeech datasets (rank0 only)...")
@@ -568,7 +565,7 @@ def main(args):
         print(f"Warning: SPM model not found at {args.spm_model_path}. Assuming user will provide.")
     tokenizer = SentencePieceTransform(args.spm_model_path)
 
-    # ★ download=False: rank별로 다운로드 시도/경합 방지
+    
     train_dataset = AlgoPerfLibriSpeech(
         root=args.data_path,
         url="train-clean-100",
@@ -588,7 +585,7 @@ def main(args):
         pin_memory=True,
         drop_last=True,
         persistent_workers=(args.workers > 0),
-        timeout=args.dataloader_timeout,      # ★ hang 대신 에러로 뱉게 해서 원인 추적 쉬움
+        timeout=args.dataloader_timeout,      
         worker_init_fn=seed_worker,
         generator=torch.Generator().manual_seed(args.seed + global_rank),
         prefetch_factor=args.prefetch_factor if args.workers > 0 else None,
@@ -845,7 +842,7 @@ if __name__ == "__main__":
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
     parser.add_argument('--precondition-frequency', type=int, default=50)
     parser.add_argument('--start-preconditioning-step', type=int, default=50)
-    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.0)
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.5)
     parser.add_argument('--max-epsilon', type=float, default=1e-7)
     parser.add_argument('--epsilon-preset', type=str, default='default', choices=['default', 'asymmetric'])
 

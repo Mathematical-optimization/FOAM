@@ -125,11 +125,9 @@ class ShampooMonitor:
         self.train_losses = []
         self.epochs = []
         
-        # DryShampoo Stats [Updated]
         self.epoch_stats = defaultdict(lambda: {'L_updated': 0, 'L_total': 0, 'R_updated': 0, 'R_total': 0})
         self.epoch_eigh_times = {}
         self.rc_history = defaultdict(list)
-        # Epsilon History를 L과 R로 구분하여 저장하도록 수정
         self.epsilon_history = defaultdict(lambda: {'L': [], 'R': []})
         self.param_index_to_name = {}
 
@@ -147,9 +145,6 @@ class ShampooMonitor:
         self.train_losses.append(train_loss)
 
     def log_update(self, epoch, param_idx, dim_idx, updated, rc_value, epsilon_value):
-        # 통계 수집은 모든 rank에서 수행하고 나중에 reduce 할 수 있도록 rank check 제거 또는 유지
-        # 여기서는 vit.py 구조를 따라감
-        
         key_prefix = 'L' if dim_idx == 0 else 'R'
         self.epoch_stats[epoch][f'{key_prefix}_total'] += 1
         if updated:
@@ -164,7 +159,6 @@ class ShampooMonitor:
         if self.rank != 0: return
         self.epoch_eigh_times[epoch] = time_sec
 
-    # [NEW] vit.py에서 가져온 집계 함수 추가
     def get_local_epoch_data(self, epoch):
         stats = self.epoch_stats[epoch]
         eps_dict = self.epsilon_history[epoch]
@@ -221,16 +215,13 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
         should_recompute_eigen = True
         rc_val_to_log = None 
 
-        # DryShampoo Algorithm 3: Check conditions if we have stale eigenbases
         if prev_Q is not None and prev_D is not None and self._matrix_root_inv_threshold > 0.0:
             try:
-                # 1. Compute RC (Relative Condition Number)
                 rc_t = self._compute_relative_condition_number(
                     bias_corrected_factor_matrix, prev_Q, prev_D, current_epsilon
                 )
                 rc_val_to_log = rc_t.item()
 
-                # 2. Calculate Alpha (Spectral Norm / Frobenius Norm of H)
                 inv_root_exponent = -self._exponent_multiplier / root
                 h_eigenvalues = (prev_D + current_epsilon).pow(inv_root_exponent)
                 
@@ -238,13 +229,10 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                 frobenius_norm = torch.norm(h_eigenvalues, p=2)
                 alpha = spectral_norm / (frobenius_norm + 1e-25)
 
-                # 3. Propose New Epsilon
                 new_epsilon = current_epsilon * ((rc_t * alpha) / self._matrix_root_inv_threshold)
                 
-                # 4. Condition Check
                 if (rc_t * alpha) >= self._matrix_root_inv_threshold:
                     if new_epsilon < self._max_epsilon:
-                        # Fast Update with increased epsilon
                         current_epsilon = float(new_epsilon)
                         should_recompute_eigen = False
                         
@@ -256,11 +244,9 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                         inv_factor_matrix.copy_(computed_inv_factor_matrix)
                         kronecker_factors.adaptive_epsilons[factor_idx] = current_epsilon
                     else:
-                        # Very Unstable -> Slow Update (Full Eigen) with base epsilon
                         current_epsilon = epsilon_value
                         should_recompute_eigen = True 
                 else:
-                    # Stable -> Fast Update
                     current_epsilon = float(new_epsilon)
                     should_recompute_eigen = False
                     
@@ -290,7 +276,6 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                 computed_inv_factor_matrix, used_epsilon, L, Q = result
                 
                 if L is not None and Q is not None:
-                    # Store Raw Eigenvalues (L - epsilon) for next step
                     raw_eigenvalues = L - used_epsilon
                     kronecker_factors.eigenvalues[factor_idx] = raw_eigenvalues.to(dtype=factor_matrix.dtype)
                     kronecker_factors.eigenvectors[factor_idx] = Q.to(dtype=factor_matrix.dtype)
@@ -350,10 +335,6 @@ def get_lr_schedule(current_step, warmup_steps, base_lr, total_steps):
 # ==========================================
 
 class SentencePieceTransform:
-    """
-    ALGOPERF 벤치마크 규격에 맞춘 SentencePiece Tokenizer 
-    Vocab Size: 1024
-    """
     def __init__(self, model_path):
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"SentencePiece model not found at {model_path}. Please generate it with vocab_size=1024.")
@@ -379,7 +360,6 @@ class AlgoPerfLibriSpeech(Dataset):
         self.args = args
         
         if self.train:
-            # 전체 학습을 위해서는 ds1, ds2, ds3 모두 사용 권장
             ds1 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-clean-100", download=True)
             ds2 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-clean-360", download=True)
             ds3 = torchaudio.datasets.LIBRISPEECH(root=root, url="train-other-500", download=True)
@@ -394,7 +374,6 @@ class AlgoPerfLibriSpeech(Dataset):
             n_mels=args.n_mels
         )
         
-        # SpecAugment
         self.spec_augment = nn.Sequential(
             torchaudio.transforms.TimeMasking(time_mask_param=35),
             torchaudio.transforms.FrequencyMasking(freq_mask_param=27)
@@ -404,28 +383,22 @@ class AlgoPerfLibriSpeech(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        # 유효한 데이터를 찾을 때까지 반복 (재귀 호출 대신 while문 권장)
         while True:
             try:
-                # 데이터 로딩 시도
                 waveform, sample_rate, transcript, _, _, _ = self.dataset[idx]
                 
-                # 길이가 너무 긴 경우 패스하고 다른 데이터 찾기
                 if waveform.shape[1] > self.args.max_audio_length:
                     idx = random.randint(0, len(self.dataset) - 1)
                     continue
 
                 spec = self.melspec(waveform)
                 
-                # Train 모드일 때만 SpecAugment 적용
                 if self.train:
                     spec = self.spec_augment(spec)
                 
-                # (Freq, Time) -> (Time, Freq)
                 return spec.squeeze(0).transpose(0, 1), transcript
 
             except Exception as e:
-                # 로딩 실패 시 다른 인덱스로 재시도
                 idx = random.randint(0, len(self.dataset) - 1)
 
 def get_collate_fn(tokenizer):
@@ -457,19 +430,9 @@ def get_collate_fn(tokenizer):
 # ==========================================
 
 class ConformerAlgoPerf(nn.Module):
-    """
-    ALGOPERF 벤치마크 및 원본 논문의 Conformer 구조 구현
-    - Convolution Subsampling 포함
-    - Linear Projection 포함
-    - Conformer Encoder + CTC Head
-    """
     def __init__(self, num_classes, input_dim=80, encoder_dim=144, num_layers=16, num_heads=4, depthwise_kernel_size=32):
         super(ConformerAlgoPerf, self).__init__()
         
-        # Convolution Subsampling (Stride 4)
-        # 입력: (Batch, 1, Time, Freq)
-        # Conv1: (1, dim, 3, 2) -> (Batch, dim, T/2, F/2)
-        # Conv2: (dim, dim, 3, 2) -> (Batch, dim, T/4, F/4)
         self.subsampling = nn.Sequential(
             nn.Conv2d(1, encoder_dim, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
@@ -477,51 +440,38 @@ class ConformerAlgoPerf(nn.Module):
             nn.ReLU(),
         )
         
-        # Subsampling 후 차원 계산 (80 dim 기준)
-        # Freq: 80 -> 40 -> 20
         flattened_dim = encoder_dim * (((input_dim - 1) // 2 + 1 - 1) // 2 + 1)
         self.input_projection = nn.Linear(flattened_dim, encoder_dim)
 
-        # Conformer 차원 설정 (encoder_dim 사용) 
         self.conformer = torchaudio.models.Conformer(
-            input_dim=encoder_dim,  # input_dim 80이 아닌 인코더 차원(144)을 입력받음
+            input_dim=encoder_dim,
             num_heads=num_heads,
             ffn_dim=encoder_dim * 4,
             num_layers=num_layers,
             depthwise_conv_kernel_size=depthwise_kernel_size
         )
         
-        # CTC Head
         self.fc = nn.Linear(encoder_dim, num_classes) 
         self._init_weights()
 
     def _init_weights(self):
-        # "Model weights are initialized using Xavier uniform initialization"
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
     def forward(self, x, input_lengths):
-        # x shape: (Batch, Time, Freq) -> (Batch, 1, Time, Freq)
         x = x.unsqueeze(1)
-        
-        # Subsampling
         x = self.subsampling(x)
         
-        # Permute for Linear Projection: (Batch, OutChannel, Time, Freq) -> (Batch, Time, OutChannel*Freq)
         b, c, t, f = x.size()
         x = x.permute(0, 2, 1, 3).contiguous().view(b, t, c * f)
         
-        # Linear Projection
         x = self.input_projection(x)
         
-        # Lengths Adjustment (Stride 4 subsampling)
         input_lengths = (((input_lengths - 1) // 2 + 1 - 1) // 2 + 1)
 
-        # Conformer Encoder
         out, out_lengths = self.conformer(x, input_lengths)
         
-        # CTC Output
         out = self.fc(out)
         out = F.log_softmax(out, dim=2)
         out = out.transpose(0, 1) # (Time, Batch, Class) for PyTorch CTCLoss
@@ -537,7 +487,6 @@ def main(args):
     global_rank = dist.get_rank()
     world_size = dist.get_world_size()
     
-    # WandB 초기화 (Rank 0)
     if global_rank == 0:
         wandb.init(
             project=args.project,
@@ -561,11 +510,10 @@ def main(args):
         print("Downloading Librispeech datasets...")
         torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-clean-100", download=True)
         # 필요한 경우 주석 해제 (전체 학습 시)
-        torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-clean-360", download=True)
-        torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-other-500", download=True)  
+        # torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-clean-360", download=True)
+        # torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-other-500", download=True)  
     dist.barrier()
 
-    # Tokenizer 설정
     if global_rank == 0 and not os.path.exists(args.spm_model_path):
         print(f"Warning: SPM model not found at {args.spm_model_path}. Assuming user will provide.")
     tokenizer = SentencePieceTransform(args.spm_model_path)
@@ -589,7 +537,6 @@ def main(args):
         drop_last=True
     )
 
-    # 모델 파라미터 적용 (Conformer Small 기준)
     model = ConformerAlgoPerf(
         num_classes=len(tokenizer),
         input_dim=args.n_mels,
@@ -601,7 +548,6 @@ def main(args):
 
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
-    # Logging & Monitor Setup
     eigh_fallback_handler = EighFallbackCounter()
     matrix_logger = logging.getLogger('optimizers.matrix_functions')
     matrix_logger.setLevel(logging.WARNING)
@@ -649,7 +595,6 @@ def main(args):
         distributed_config=distributed_config,
         preconditioner_dtype=torch.float32,
         use_protected_eigh=True,
-        # DryShampoo Params
         matrix_root_inv_threshold=args.matrix_root_inv_threshold, 
         max_epsilon=args.max_epsilon 
     )
@@ -679,8 +624,22 @@ def main(args):
         valid_batches = 0
         
         for batch_idx, (spectrograms, labels, input_lengths, label_lengths) in enumerate(train_loader):
-            if spectrograms is None: continue
+            # ========================================================
+            # [Fix 1] DDP Synchronization for Empty Batches
+            # ========================================================
+            # Check if current rank has valid data
+            has_data = torch.tensor(1.0 if spectrograms is not None else 0.0, device=local_rank)
             
+            # Broadcast validation to all ranks (ReduceOp.MIN ensures if ANY rank fails, result is 0)
+            dist.all_reduce(has_data, op=dist.ReduceOp.MIN)
+            
+            # If any rank failed to load data, everyone skips to maintain synchronization
+            if has_data.item() == 0.0:
+                if global_rank == 0:
+                    print(f"Warning: Skipping batch {batch_idx} due to empty data on one or more ranks.")
+                continue
+            
+            # Safe to unpack
             spectrograms = spectrograms.to(local_rank, non_blocking=True)
             labels = labels.to(local_rank, non_blocking=True)
             input_lengths = input_lengths.to(local_rank, non_blocking=True)
@@ -694,17 +653,28 @@ def main(args):
             
             # Forward
             outputs, output_lengths = model(spectrograms, input_lengths)
+            
+            # Loss Calculation
+            # CTC Loss may return Inf/NaN if output_lengths < label_lengths
             loss = criterion(outputs, labels, output_lengths, label_lengths)
             
-            is_invalid = torch.tensor(0.0, device= local_rank)
+            # ========================================================
+            # [Fix 3] Synchronized NaN/Inf Handling
+            # ========================================================
+            is_invalid = torch.tensor(0.0, device=local_rank)
             if torch.isnan(loss) or torch.isinf(loss):
-                is_invalid = torch.tensor(1.0, device = local_rank)
+                is_invalid = torch.tensor(1.0, device=local_rank)
             
-            dist.all_reduce(is_invalid, op = dist.ReduceOp.SUM)
+            # All ranks must participate in this reduction
+            dist.all_reduce(is_invalid, op=dist.ReduceOp.SUM)
+            
             if is_invalid > 0:
                 if global_rank == 0:
-                    print(f"Warning : NaN/Inf loss detected on one or more ranks at step {global_step}. Skipping step globally ")
-                    continue
+                    print(f"Warning: NaN/Inf loss detected on one or more ranks at step {global_step}. Skipping step globally.")
+                # Important: Do not optimize, but CONTINUE the loop to keep DDP synced
+                # Since we already synchronized with all_reduce, simple continue is safe here 
+                # as long as we don't call .backward() or .step() on only some ranks.
+                continue
                     
             loss.backward()
             
@@ -741,7 +711,6 @@ def main(args):
             avg_eigh_time = dist_eigh_time.item() / world_size
             monitor.log_eigh_time(epoch + 1, avg_eigh_time)
             
-            # [FIXED] vit.py 스타일의 상세 DryShampoo 지표 수집 및 로깅
             local_stats = monitor.get_local_epoch_data(epoch).to(local_rank)
             dist.all_reduce(local_stats, op=dist.ReduceOp.SUM)
             
@@ -798,8 +767,7 @@ if __name__ == "__main__":
     parser.add_argument('--n-mels', type=int, default=80)
     parser.add_argument('--max-audio-length', type=int, default=320000)
     
-    # Model Params: Conformer (Small) Configuration 
-    # Small: 10M Params, Encoder Dim 144, Layers 16, Heads 4
+    # Model Params
     parser.add_argument('--encoder-dim', type=int, default=144, help="Conformer Small: 144")
     parser.add_argument('--num-layers', type=int, default=16, help="Conformer Small: 16") 
     parser.add_argument('--num-heads', type=int, default=4, help="Conformer Small: 4")
@@ -821,7 +789,6 @@ if __name__ == "__main__":
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
     parser.add_argument('--precondition-frequency', type=int, default=50)
     parser.add_argument('--start-preconditioning-step', type=int, default=50)
-    # DryShampoo Params
     parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.0)
     parser.add_argument('--max-epsilon', type=float, default=1e-7)
     parser.add_argument('--epsilon-preset', type=str, default='default', choices=['default', 'asymmetric'])
@@ -830,8 +797,6 @@ if __name__ == "__main__":
     parser.add_argument('--log-interval', type=int, default=50)
     parser.add_argument('--save-interval', type=int, default=5)
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
-    
-    # WandB Params
     parser.add_argument('--project', type=str, default='conformer-dryshampoo', help='WandB project name')
     parser.add_argument('--entity', type=str, default=None, help='WandB entity')
     parser.add_argument('--run-name', type=str, default=None, help='WandB run name')

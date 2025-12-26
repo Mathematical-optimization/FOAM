@@ -9,7 +9,7 @@ set -x
 # --- 사용자 설정 변수 ---
 # 사용할 GPU ID 설정
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-
+export WANDB_API_KEY="37d143039a17dfe05b4e0e5314eccaae6016efd0"
 # 사용할 GPU 개수
 N_GPUS=4
 
@@ -35,16 +35,16 @@ BATCH_SIZE_PER_GPU=256  # GPU 메모리에 맞춰 조절
 WORKERS=4              # 데이터 로딩 워커 수
 
 # 옵티마이저 및 스케줄러 하이퍼파라미터
-LR=0.0002
-WARMUP_STEPS=5000
-WEIGHT_DECAY=1e-5
-BETA1=0.95
-BETA2=0.98
+LR=0.001
+WARMUP_STEPS=1250
+WEIGHT_DECAY=5e-5
+BETA1=0.975
+BETA2=0.99
 
 # Shampoo 하이퍼파라미터
 MAX_PRECOND_DIM=1024
-PRECOND_FREQ=100
-START_PRECOND_STEP=100
+PRECOND_FREQ=50
+START_PRECOND_STEP=50
 
 # 실행 이름 설정 (날짜 포함)
 RUN_NAME="conformer_shampoo_LR${LR}_WD${WEIGHT_DECAY}_B1${BETA1}_$(date +%Y%m%d_%H%M%S)"

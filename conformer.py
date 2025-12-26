@@ -13,13 +13,13 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn import functional as F
 import torchaudio
+import re
 import logging
 from torch.utils.data import ConcatDataset
 from dataclasses import dataclass
 from collections import defaultdict
-from typing import Dict, List, Optional
 
-# 시각화를 위한 라이브러리
+# 시각화를 위한 라이브러리 (필요 시 사용)
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
@@ -27,10 +27,10 @@ import pandas as pd
 # WandB
 import wandb
 
-# SentencePiece (필수 설치: pip install sentencepiece)
+# SentencePiece
 import sentencepiece as spm
 
-# Shampoo Optimizer Imports (가정: 해당 경로에 모듈이 존재함)
+# Shampoo Optimizer Imports
 from optimizers.distributed_shampoo.distributed_shampoo import DistributedShampoo
 from optimizers.distributed_shampoo.shampoo_types import (
     AdamGraftingConfig,
@@ -87,7 +87,7 @@ class EnhancedWallClockProfiler:
     def get_stats(self, name: str) -> TimingStats:
         return self.timers[name]
 
-    def reset_epoch_timers(self, epoch: int):
+    def reset_epoch_timers(self):
         for stats in self.timers.values():
             stats.reset_epoch_stats()
 
@@ -274,7 +274,7 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                 should_recompute_eigen = True
 
         if should_recompute_eigen:
-            if is_factor_matrix_diagonal and not check_diagonal(factor_matrix):
+            if is_factor_matrix_diagonal is not None and bool(is_factor_matrix_diagonal.item()) and not check_diagonal(factor_matrix):
                 is_factor_matrix_diagonal.copy_(torch.tensor(False))
             try:
                 result = matrix_inverse_root(
@@ -328,7 +328,6 @@ def set_seed_distributed(seed: int = 42, rank: int = 0):
 
 
 def seed_worker(worker_id: int):
-    # DataLoader worker마다 재현 가능한 시드 부여
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
@@ -418,12 +417,11 @@ class AlgoPerfLibriSpeech(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        # ★ DDP hang 방지: 무한 재시도 금지
         max_retry = getattr(self.args, "max_getitem_retry", 20)
 
         for _ in range(max_retry):
             try:
-                waveform, sample_rate, transcript, _, _, _ = self.dataset[idx]
+                waveform, _, transcript, _, _, _ = self.dataset[idx]
 
                 if waveform.shape[1] > self.args.max_audio_length:
                     idx = random.randint(0, len(self.dataset) - 1)
@@ -439,13 +437,11 @@ class AlgoPerfLibriSpeech(Dataset):
             except Exception:
                 idx = random.randint(0, len(self.dataset) - 1)
 
-        # ★ 실패하면 None 반환 → collate에서 제거 → 배치가 비면 has_data 로직으로 전체 skip
         return None
 
 
 def get_collate_fn(tokenizer):
     def collate_fn(batch):
-        # batch 내 None 제거
         batch = [item for item in batch if item is not None]
         if len(batch) == 0:
             return None, None, None, None
@@ -525,7 +521,107 @@ class ConformerAlgoPerf(nn.Module):
 
 
 # ==========================================
-# 4. Main Training Loop
+# 4. WER utilities
+# ==========================================
+
+def _ctc_greedy_decode_batch(log_probs_TBC, out_lengths, blank_id: int):
+    with torch.no_grad():
+        pred = torch.argmax(log_probs_TBC, dim=2).transpose(0, 1)  # (B,T)
+
+    B, T = pred.shape
+    results = []
+    for b in range(B):
+        L = int(out_lengths[b].item())
+        seq = pred[b, :L].tolist()
+
+        collapsed = []
+        prev = None
+        for t in seq:
+            if t != prev:
+                collapsed.append(t)
+            prev = t
+
+        collapsed = [t for t in collapsed if t != blank_id]
+        results.append(collapsed)
+    return results
+
+
+def _normalize_text_for_wer(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _levenshtein_distance_words(ref_words, hyp_words) -> int:
+    R, H = len(ref_words), len(hyp_words)
+    if R == 0:
+        return H
+    if H == 0:
+        return R
+
+    dp = list(range(H + 1))
+    for i in range(1, R + 1):
+        prev = dp[0]
+        dp[0] = i
+        for j in range(1, H + 1):
+            cur = dp[j]
+            cost = 0 if ref_words[i - 1] == hyp_words[j - 1] else 1
+            dp[j] = min(dp[j] + 1, dp[j - 1] + 1, prev + cost)
+            prev = cur
+    return dp[H]
+
+
+@torch.no_grad()
+def compute_wer_ddp(model, val_loader, tokenizer, device, blank_id: int, max_batches: int = 0):
+    model.eval()
+
+    local_err = 0
+    local_words = 0
+
+    for bidx, (spectrograms, labels, input_lengths, label_lengths) in enumerate(val_loader):
+        if max_batches > 0 and bidx >= max_batches:
+            break
+
+        has_data = torch.tensor(1 if spectrograms is not None else 0, device=device, dtype=torch.int32)
+        dist.all_reduce(has_data, op=dist.ReduceOp.MIN)
+        if has_data.item() == 0:
+            continue
+
+        spectrograms = spectrograms.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        input_lengths = input_lengths.to(device, non_blocking=True)
+        label_lengths = label_lengths.to(device, non_blocking=True)
+
+        outputs, out_lengths = model(spectrograms, input_lengths)  # (T,B,C)
+        hyp_token_ids = _ctc_greedy_decode_batch(outputs, out_lengths, blank_id)
+
+        B = labels.size(0)
+        for i in range(B):
+            ref_ids = labels[i, : int(label_lengths[i].item())].tolist()
+
+            ref_text = _normalize_text_for_wer(tokenizer.int_to_text(ref_ids))
+            hyp_text = _normalize_text_for_wer(tokenizer.int_to_text(hyp_token_ids[i]))
+
+            ref_words = ref_text.split(" ") if ref_text else []
+            hyp_words = hyp_text.split(" ") if hyp_text else []
+
+            if len(ref_words) == 0:
+                continue
+
+            local_err += _levenshtein_distance_words(ref_words, hyp_words)
+            local_words += len(ref_words)
+
+    t = torch.tensor([local_err, local_words], device=device, dtype=torch.long)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+    total_err = t[0].item()
+    total_words = t[1].item()
+    wer = total_err / max(1, total_words)
+    return wer, total_err, total_words
+
+
+# ==========================================
+# 5. Main Training Loop
 # ==========================================
 
 def main(args):
@@ -550,30 +646,24 @@ def main(args):
     if global_rank == 0:
         print(f"Training Config: {args}")
         print(f"World Size: {world_size}, Local Rank: {local_rank}")
-        print(f"Model Architecture: Conformer Small (10M Params)")
+        print("Model Architecture: Conformer Small (10M Params)")
 
-    
+    # ---- Download datasets on rank0 only (include val split) ----
     if global_rank == 0:
         os.makedirs(args.data_path, exist_ok=True)
         print("Downloading Librispeech datasets (rank0 only)...")
         torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-clean-100", download=True)
         torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-clean-360", download=True)
         torchaudio.datasets.LIBRISPEECH(root=args.data_path, url="train-other-500", download=True)
+        torchaudio.datasets.LIBRISPEECH(root=args.data_path, url=args.val_url, download=True)
     dist.barrier()
 
-    if global_rank == 0 and not os.path.exists(args.spm_model_path):
-        print(f"Warning: SPM model not found at {args.spm_model_path}. Assuming user will provide.")
     tokenizer = SentencePieceTransform(args.spm_model_path)
 
-    
+    # ---- Train dataset/loader ----
     train_dataset = AlgoPerfLibriSpeech(
-        root=args.data_path,
-        url="train-clean-100",
-        download=False,
-        train=True,
-        args=args
+        root=args.data_path, url="train-clean-100", download=False, train=True, args=args
     )
-
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True)
 
     train_loader = DataLoader(
@@ -585,12 +675,35 @@ def main(args):
         pin_memory=True,
         drop_last=True,
         persistent_workers=(args.workers > 0),
-        timeout=args.dataloader_timeout,      
+        timeout=args.dataloader_timeout,
         worker_init_fn=seed_worker,
         generator=torch.Generator().manual_seed(args.seed + global_rank),
         prefetch_factor=args.prefetch_factor if args.workers > 0 else None,
     )
 
+    # ---- Val dataset/loader for WER ----
+    val_dataset = AlgoPerfLibriSpeech(
+        root=args.data_path, url=args.val_url, download=False, train=False, args=args
+    )
+    val_sampler = DistributedSampler(
+        val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False, drop_last=False
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.wer_batch_size,
+        sampler=val_sampler,
+        num_workers=args.workers,
+        collate_fn=get_collate_fn(tokenizer),
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(args.workers > 0),
+        timeout=args.dataloader_timeout,
+        worker_init_fn=seed_worker,
+        generator=torch.Generator().manual_seed(args.seed + 1234 + global_rank),
+        prefetch_factor=args.prefetch_factor if args.workers > 0 else None,
+    )
+
+    # ---- Model ----
     model = ConformerAlgoPerf(
         num_classes=len(tokenizer),
         input_dim=args.n_mels,
@@ -602,6 +715,7 @@ def main(args):
 
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
+    # ---- Logging hooks ----
     eigh_fallback_handler = EighFallbackCounter()
     matrix_logger = logging.getLogger('optimizers.matrix_functions')
     matrix_logger.setLevel(logging.WARNING)
@@ -630,6 +744,7 @@ def main(args):
 
     ShampooPreconditionerList.compute_root_inverse = timed_compute_root_inverse_wrapper
 
+    # ---- Optimizer ----
     distributed_config = DDPShampooConfig(
         communication_dtype=CommunicationDType.FP32,
         num_trainers_per_group=world_size,
@@ -673,21 +788,19 @@ def main(args):
     model.train()
     for epoch in range(args.epochs):
         current_epoch_ref['epoch'] = epoch
-        wall_clock_profiler.reset_epoch_timers(epoch)
+        wall_clock_profiler.reset_epoch_timers()
         eigh_monitor.reset_epoch()
         eigh_fallback_handler.count = 0
 
         train_sampler.set_epoch(epoch)
+
         epoch_loss = 0.0
         valid_batches = 0
 
         for batch_idx, (spectrograms, labels, input_lengths, label_lengths) in enumerate(train_loader):
-            # ========================================================
-            # [Fix 1] DDP Synchronization for Empty Batches
-            # ========================================================
+            # ---- Empty-batch sync skip ----
             has_data = torch.tensor(1 if spectrograms is not None else 0, device=device, dtype=torch.int32)
             dist.all_reduce(has_data, op=dist.ReduceOp.MIN)
-
             if has_data.item() == 0:
                 if global_rank == 0 and (batch_idx % args.log_interval == 0):
                     print(f"Warning: Skipping batch {batch_idx} due to empty data on one or more ranks.")
@@ -704,18 +817,12 @@ def main(args):
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Forward
             outputs, output_lengths = model(spectrograms, input_lengths)
-
-            # Loss
             loss = criterion(outputs, labels, output_lengths, label_lengths)
 
-            # ========================================================
-            # [Fix 2] Synchronized NaN/Inf Handling (Tensor if 사용 금지)
-            # ========================================================
+            # ---- NaN/Inf sync skip ----
             is_invalid = (~torch.isfinite(loss.detach())).to(dtype=torch.int32, device=device)
             dist.all_reduce(is_invalid, op=dist.ReduceOp.SUM)
-
             if is_invalid.item() > 0:
                 if global_rank == 0:
                     print(f"Warning: NaN/Inf loss detected on one or more ranks at step {global_step}. Skipping step globally.")
@@ -744,9 +851,7 @@ def main(args):
                     "global_step": global_step
                 })
 
-        # ========================================================
-        # [Fix 3] epoch-end collective는 반드시 모든 rank가 호출
-        # ========================================================
+        # ---- epoch-end collectives (ALL ranks must participate) ----
         epoch_eigendecomp_time = wall_clock_profiler.get_stats("eigendecomposition").epoch_time
         dist_eigh_time = torch.tensor([epoch_eigendecomp_time], device=device, dtype=torch.float64)
         dist.all_reduce(dist_eigh_time, op=dist.ReduceOp.SUM)
@@ -754,6 +859,19 @@ def main(args):
 
         local_stats = monitor.get_local_epoch_data(epoch).to(device=device)
         dist.all_reduce(local_stats, op=dist.ReduceOp.SUM)
+
+        val_sampler.set_epoch(epoch)
+        blank_id = len(tokenizer) - 1
+
+        wer, wer_err, wer_words = compute_wer_ddp(
+            model=model,
+            val_loader=val_loader,
+            tokenizer=tokenizer,
+            device=device,
+            blank_id=blank_id,
+            max_batches=args.wer_max_batches
+        )
+        model.train()
 
         if global_rank == 0:
             avg_loss = epoch_loss / valid_batches if valid_batches > 0 else 0.0
@@ -768,15 +886,15 @@ def main(args):
             sum_eps_r, len_eps_r = local_stats[4].item(), local_stats[5].item()
             l_tot, r_tot = int(local_stats[6].item()), int(local_stats[7].item())
 
-            l_pct = (l_up / l_tot * 100) if l_tot > 0 else 0
-            r_pct = (r_up / r_tot * 100) if r_tot > 0 else 0
-
+            l_pct = (l_up / l_tot * 100) if l_tot > 0 else 0.0
+            r_pct = (r_up / r_tot * 100) if r_tot > 0 else 0.0
             avg_eps_l = sum_eps_l / max(1.0, len_eps_l)
             avg_eps_r = sum_eps_r / max(1.0, len_eps_r)
 
             print(f"    Avg eigendecomp time (all ranks): {avg_eigh_time:.3f}s")
             print(f"    DryShampoo Updates (L/R): {l_pct:.1f}% / {r_pct:.1f}%")
             print(f"    Avg Epsilon (L/R): {avg_eps_l:.2e} / {avg_eps_r:.2e}")
+            print(f"    WER (val={args.val_url}): {wer*100:.2f}%  (errors={wer_err}, ref_words={wer_words})")
 
             wandb.log({
                 "train/epoch_avg_loss": avg_loss,
@@ -785,6 +903,10 @@ def main(args):
                 "shampoo/R_update_pct": r_pct,
                 "shampoo/avg_epsilon_L": avg_eps_l,
                 "shampoo/avg_epsilon_R": avg_eps_r,
+                "eval/wer": wer,
+                "eval/wer_pct": wer * 100.0,
+                "eval/wer_errors": wer_err,
+                "eval/wer_ref_words": wer_words,
                 "epoch": epoch + 1
             })
 
@@ -808,7 +930,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Conformer Small Training with Distributed Shampoo')
+    parser = argparse.ArgumentParser(description='Conformer Small Training with Distributed Shampoo + WER per epoch')
 
     # Data Params
     parser.add_argument('--data-path', type=str, default='./data', help='Dataset path')
@@ -844,7 +966,6 @@ if __name__ == "__main__":
     parser.add_argument('--start-preconditioning-step', type=int, default=50)
     parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.5)
     parser.add_argument('--max-epsilon', type=float, default=1e-7)
-    parser.add_argument('--epsilon-preset', type=str, default='default', choices=['default', 'asymmetric'])
 
     # Logistics
     parser.add_argument('--log-interval', type=int, default=50)
@@ -858,6 +979,13 @@ if __name__ == "__main__":
     parser.add_argument('--dist-timeout-min', type=int, default=10, help='Process group timeout (minutes)')
     parser.add_argument('--dataloader-timeout', type=int, default=60, help='DataLoader worker timeout (seconds). 0 disables.')
     parser.add_argument('--prefetch-factor', type=int, default=2, help='DataLoader prefetch_factor (workers>0 only)')
+
+    # WER eval
+    parser.add_argument('--val-url', type=str, default='dev-clean',
+                        help='LIBRISPEECH split for WER eval (e.g., dev-clean, dev-other, test-clean, test-other)')
+    parser.add_argument('--wer-batch-size', type=int, default=256, help='Per-GPU batch size for WER evaluation')
+    parser.add_argument('--wer-max-batches', type=int, default=0,
+                        help='0 = full val, else evaluate only first N batches')
 
     args = parser.parse_args()
     os.makedirs(args.checkpoint_dir, exist_ok=True)

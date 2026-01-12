@@ -964,12 +964,12 @@ if __name__ == "__main__":
     parser.add_argument('--max-preconditioner-dim', type=int, default=1024)
     parser.add_argument('--precondition-frequency', type=int, default=50)
     parser.add_argument('--start-preconditioning-step', type=int, default=50)
-    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.5)
+    parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.4)
     parser.add_argument('--max-epsilon', type=float, default=1e-7)
 
     # Logistics
     parser.add_argument('--log-interval', type=int, default=50)
-    parser.add_argument('--save-interval', type=int, default=5)
+    parser.add_argument('--save-interval', type=int, default=30, help='Save checkpoint every N epochs')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
     parser.add_argument('--project', type=str, default='conformer-dryshampoo', help='WandB project name')
     parser.add_argument('--entity', type=str, default=None, help='WandB entity')

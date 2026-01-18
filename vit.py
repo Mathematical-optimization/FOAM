@@ -635,19 +635,12 @@ def get_epsilon_config(args):
             'epsilon_right': None,
             'use_adaptive_epsilon': False,
             'condition_thresholds': None
-        },
-        'asymmetric': {
-            'epsilon': 1e-09,
-            'epsilon_left': 1e-08,
-            'epsilon_right': 1e-08,
-            'use_adaptive_epsilon': False,
-            'condition_thresholds': None
-        },
+        }
     }
     if args.epsilon_preset in presets:
         return presets[args.epsilon_preset]
     else:
-        config = {'epsilon': 1e-08, 'epsilon_left': None, 'epsilon_right': None, 'use_adaptive_epsilon': False}
+        config = {'epsilon': 1e-09, 'epsilon_left': None, 'epsilon_right': None, 'use_adaptive_epsilon': False}
         if args.epsilon is not None: config['epsilon'] = args.epsilon
         return config
 
@@ -1019,11 +1012,11 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=42)
 
     parser.add_argument('--matrix-root-inv-threshold', type=float, default=0.5)
-    parser.add_argument('--max-epsilon', type=float, default=3e-07)
+    parser.add_argument('--max-epsilon', type=float, default=5e-07)
     parser.add_argument('--project', type=str, default='DryShampoo_Experiment_ViT')
     parser.add_argument('--entity', type=str, default = 'Kyunghun')
 
-    parser.add_argument('--epsilon-preset', type=str, default='default', choices=['default', 'asymmetric'])
+    parser.add_argument('--epsilon-preset', type=str, default='default')
     parser.add_argument('--epsilon', type=float, default=None)
     parser.add_argument('--epsilon-left', type=float, default=None)
     parser.add_argument('--epsilon-right', type=float, default=None)

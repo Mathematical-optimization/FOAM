@@ -384,7 +384,7 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                         current_epsilon = epsilon_value
                         should_recompute_eigen = True 
                 else:
-                    current_epsilon = float(new_epsilon)
+                    current_epsilon = max(float(new_epsilon), float(epsilon_value))
                     should_recompute_eigen = False
                     alpha_pow = -self._exponent_multiplier / root
                     eig_term = (prev_D + current_epsilon).pow(alpha_pow)

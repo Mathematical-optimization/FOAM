@@ -369,6 +369,7 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
                 alpha = spectral_norm / (frobenius_norm + 1e-25)
 
                 new_epsilon = current_epsilon * ((rc_t * alpha) / self._matrix_root_inv_threshold)
+                new_epsilon = new_epsilon / 2
                 
                 if (rc_t * alpha) >= self._matrix_root_inv_threshold:
                     if new_epsilon < self._max_epsilon:

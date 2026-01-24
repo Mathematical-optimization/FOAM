@@ -370,7 +370,7 @@ def patch_shampoo_optimizer(optimizer, monitor, current_epoch_fn, eigh_monitor):
 
                 new_epsilon = current_epsilon * ((rc_t * (alpha / root)) / self._matrix_root_inv_threshold)
                 
-                if (rc_t * alpha) >= self._matrix_root_inv_threshold:
+                if (rc_t * (alpha / root)) >= self._matrix_root_inv_threshold:
                     if new_epsilon < self._max_epsilon:
                         current_epsilon = float(new_epsilon)
                         should_recompute_eigen = False

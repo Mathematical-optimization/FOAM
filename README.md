@@ -25,4 +25,4 @@ The 'matrix_root_inv_threshold' and 'max_epsilon' hyperparameters have been adde
 Our ‘adaptive’ logic has been added to Distributed Shampoo. Refer to the following link for the Distributed Shampoo implementation code.
 https://github.com/facebookresearch/optimizers.git
 
-vit.py: Source code for training ViT + ImageNet using the DryShampoo optimizer. 
+vit.py: Source code for training ViT + ImageNet using the FOAM optimizer. 

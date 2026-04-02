@@ -25,9 +25,4 @@ The 'matrix_root_inv_threshold' and 'max_epsilon' hyperparameters have been adde
 Our ‘adaptive’ logic has been added to Distributed Shampoo. Refer to the following link for the Distributed Shampoo implementation code.
 https://github.com/facebookresearch/optimizers.git
 
-If you have sufficient GPU resources, it is recommended to set both hyperparameters ‘start-preconditioning-step’ and ‘precondition-frequency’ of the existing Shampoo optimizer to 1.
-If not, we recommend setting it to a value smaller than the one set in Original Shampoo.
-
 vit.py: Source code for training ViT + ImageNet using the DryShampoo optimizer. 
-
-conformer.py: Source code for training conformer + Librispeech using the DryShampoo optimizer.

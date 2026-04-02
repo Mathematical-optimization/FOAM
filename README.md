@@ -1,5 +1,5 @@
-# DryShampoo
-This is the source code used for the 'DryShampoo' experiment.
+# FOAM
+This is the source code used for the 'FOAM' experiment.
 
     optimizer = DistributedShampoo(
         params=model.parameters(),
